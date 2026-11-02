@@ -34,6 +34,7 @@
 
 mod encode;
 mod hevc_av1;
+mod hw;
 mod out;
 mod pipeline;
 mod uncompressed;

@@ -1033,3 +1033,111 @@ fn fill(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     textureStore(out, p, P.f[0]);
 }
+
+// ---------------------------------------------------------------- movie footage
+
+// A movie frame from its decoder's 8-bit 4:2:0 planes, as effectcraft-media's convert_yuv makes
+// it, operation for operation: `src` the Y plane, `aux` the U rows above the V rows (R8, cw ×
+// 2·ch). u[0] = (cw, ch); f[0] = (y_off, y_scale, c_off, c_scale), f[1] = (cr_r, cr_g, cb_g,
+// cb_b). Chroma is upsampled from co-sited centres (¾ · nearer + ¼ · farther, each way).
+fn centred(i: i32, n: i32) -> vec2<i32> {
+    let c = min(i >> 1u, n - 1);
+    if ((i & 1) == 0) {
+        return vec2<i32>(c, max(c - 1, 0));
+    }
+    return vec2<i32>(c, min(c + 1, n - 1));
+}
+
+// The 8-bit sample (0–255) an R8 texel holds.
+fn sample8(t: texture_2d<f32>, x: i32, y: i32) -> f32 {
+    return round(textureLoad(t, vec2<i32>(x, y), 0).x * 255.0);
+}
+
+// Chroma column `cx` of plane `plane` (0 = U, 1 = V) at luma row `y`: interpolated between the
+// two nearest chroma rows and normalised.
+fn chroma_at(cx: i32, y: i32, ch: i32, plane: i32) -> f32 {
+    let r = centred(y, ch);
+    let v = sample8(aux, cx, r.x + plane * ch) * 0.75 + sample8(aux, cx, r.y + plane * ch) * 0.25;
+    return (v - P.f[0].z) * P.f[0].w;
+}
+
+@compute @workgroup_size(16, 16)
+fn yuv_rgba(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let cw = i32(P.u[0].x);
+    let ch = i32(P.u[0].y);
+    let c = centred(p.x, cw);
+    let u = chroma_at(c.x, p.y, ch, 0) * 0.75 + chroma_at(c.y, p.y, ch, 0) * 0.25;
+    let v = chroma_at(c.x, p.y, ch, 1) * 0.75 + chroma_at(c.y, p.y, ch, 1) * 0.25;
+    let y = (sample8(src, p.x, p.y) - P.f[0].x) * P.f[0].y;
+    let k = P.f[1];
+    textureStore(out, p, vec4<f32>(clamp(y + k.x * v, 0.0, 1.0), clamp(y - k.y * v - k.z * u, 0.0, 1.0), clamp(y + k.w * u, 0.0, 1.0), 1.0));
+}
+
+// A movie frame at half its size (even sizes), as effectcraft-media's half_420 makes it for a
+// reduced-resolution render: each pixel the mean of its 2 × 2 luma and the [1 6 1]/8
+// neighbourhood (each way) of its chroma sample, edges repeated. Bindings as yuv_rgba; the
+// output is cw × ch.
+fn half_chroma(cx: i32, cy: i32, ch: i32, plane: i32) -> f32 {
+    let a = sample8(aux, cx, max(cy - 1, 0) + plane * ch);
+    let b = sample8(aux, cx, cy + plane * ch);
+    let c = sample8(aux, cx, min(cy + 1, ch - 1) + plane * ch);
+    return ((a + c) * 0.125 + b * 0.75 - P.f[0].z) * P.f[0].w;
+}
+
+fn half_chroma_at(cx: i32, cy: i32, cw: i32, ch: i32, plane: i32) -> f32 {
+    let l = half_chroma(max(cx - 1, 0), cy, ch, plane);
+    let r = half_chroma(min(cx + 1, cw - 1), cy, ch, plane);
+    return (l + r) * 0.125 + half_chroma(cx, cy, ch, plane) * 0.75;
+}
+
+@compute @workgroup_size(16, 16)
+fn yuv_half(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let cw = i32(P.u[0].x);
+    let ch = i32(P.u[0].y);
+    let u = half_chroma_at(p.x, p.y, cw, ch, 0);
+    let v = half_chroma_at(p.x, p.y, cw, ch, 1);
+    let q = p * 2;
+    let y4 = sample8(src, q.x, q.y) + sample8(src, q.x + 1, q.y) + sample8(src, q.x, q.y + 1) + sample8(src, q.x + 1, q.y + 1);
+    let y = (y4 * 0.25 - P.f[0].x) * P.f[0].y;
+    let k = P.f[1];
+    textureStore(out, p, vec4<f32>(clamp(y + k.x * v, 0.0, 1.0), clamp(y - k.y * v - k.z * u, 0.0, 1.0), clamp(y + k.w * u, 0.0, 1.0), 1.0));
+}
+
+// ---------------------------------------------------------------- sampled Gaussian
+
+// raster::gauss_pass: one separable pass of a sampled Gaussian, `data` its 2r + 1 normalised
+// weights (computed on the CPU as the CPU pass does). u[0] = (r, vertical, repeat edges);
+// without repeat, pixels outside are transparent.
+@compute @workgroup_size(16, 16)
+fn gauss_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let r = i32(P.u[0].x);
+    let vertical = P.u[0].y != 0u;
+    let repeat = P.u[0].z != 0u;
+    let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1);
+    var acc = vec4<f32>(0.0);
+    for (var i = -r; i <= r; i++) {
+        let q = select(vec2<i32>(p.x + i, p.y), vec2<i32>(p.x, p.y + i), vertical);
+        let w = data[u32(i + r)];
+        if (repeat) {
+            acc += textureLoad(src, clamp(q, vec2<i32>(0), last), 0) * w;
+        } else {
+            acc += tex_get(src, q.x, q.y) * w;
+        }
+    }
+    textureStore(out, p, acc);
+}

@@ -930,6 +930,7 @@ pub const GPU_EFFECTS: &[&str] = &[
     "ec.color.exposure",
     "ec.channel.invert",
     "ec.distort.transform",
+    "ec.distort.upscale",
     "ec.distort.turbulentdisplace",
     "ec.distort.displacementmap",
     "ec.distort.wavewarp",

@@ -1,0 +1,29 @@
+[package]
+name = "effectcraft-hwcodec"
+description = "Hardware video encoding through the platform's media framework (Windows: Media Foundation, which drives NVENC, AMF or Quick Sync); unavailable elsewhere"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Not the workspace lints: platform codec APIs are COM / FFI, so this crate (and only this crate)
+# allows `unsafe`.
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[dependencies]
+log = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }

@@ -52,6 +52,17 @@ struct Planes {
     v: Vec<u16>,
 }
 
+impl Planes {
+    /// 8-bit 4:2:0 as the encoders' 16-bit samples (8-bit profiles: the same values).
+    fn widen(&mut self, yuv: &effectcraft_render::Yuv420) -> &Planes {
+        for (dst, src) in [(&mut self.y, &yuv.y), (&mut self.u, &yuv.u), (&mut self.v, &yuv.v)] {
+            dst.clear();
+            dst.extend(src.iter().map(|&b| u16::from(b)));
+        }
+        self
+    }
+}
+
 // ---------------------------------------------------------------- HEVC
 
 pub(crate) struct Hevc {
@@ -98,6 +109,16 @@ impl VideoEncoder for Hevc {
         let (w, h) = (self.w as usize, self.h as usize);
         let p = &mut self.planes;
         rgba_to_yuv420_bits(rgba, w, h, self.bits, &mut p.y, &mut p.u, &mut p.v);
+        let frame = effectcraft_hevcenc::Frame { y: &p.y, u: &p.u, v: &p.v, y_stride: w, uv_stride: w.div_ceil(2) };
+        let pk = self.enc.encode(&frame);
+        Ok(vec![Packet { data: pk.data, key: pk.keyframe, cto: 0 }])
+    }
+    fn takes_yuv420(&self) -> bool {
+        self.bits == 8
+    }
+    fn encode_yuv420(&mut self, yuv: &effectcraft_render::Yuv420, _index: u64) -> Result<Vec<Packet>> {
+        let w = self.w as usize;
+        let p = self.planes.widen(yuv);
         let frame = effectcraft_hevcenc::Frame { y: &p.y, u: &p.u, v: &p.v, y_stride: w, uv_stride: w.div_ceil(2) };
         let pk = self.enc.encode(&frame);
         Ok(vec![Packet { data: pk.data, key: pk.keyframe, cto: 0 }])
@@ -154,6 +175,16 @@ impl VideoEncoder for Av1 {
         let (w, h) = (self.w as usize, self.h as usize);
         let p = &mut self.planes;
         rgba_to_yuv420_bits(rgba, w, h, self.bits, &mut p.y, &mut p.u, &mut p.v);
+        let frame = effectcraft_av1enc::Frame { y: &p.y, u: &p.u, v: &p.v, y_stride: w, uv_stride: w.div_ceil(2) };
+        let pk = self.enc.encode(&frame);
+        Ok(vec![Packet { data: pk.data, key: pk.keyframe, cto: 0 }])
+    }
+    fn takes_yuv420(&self) -> bool {
+        self.bits == 8
+    }
+    fn encode_yuv420(&mut self, yuv: &effectcraft_render::Yuv420, _index: u64) -> Result<Vec<Packet>> {
+        let w = self.w as usize;
+        let p = self.planes.widen(yuv);
         let frame = effectcraft_av1enc::Frame { y: &p.y, u: &p.u, v: &p.v, y_stride: w, uv_stride: w.div_ceil(2) };
         let pk = self.enc.encode(&frame);
         Ok(vec![Packet { data: pk.data, key: pk.keyframe, cto: 0 }])

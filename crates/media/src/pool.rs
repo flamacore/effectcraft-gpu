@@ -214,7 +214,18 @@ struct Inner {
     /// Movies that failed to open or decode (path to a readable reason; see
     /// [`FootageSource::problem`]). The first failure of a file is logged, later ones are not.
     problems: Mutex<HashMap<Arc<str>, String>>,
+    /// The GPU's video decoder per movie (`effectcraft-hwcodec`) and when it was last used,
+    /// `None` where it can't take the file (not retried until `forget`): those decode with
+    /// FilmCraft. At most [`HW_DECODERS`] are open (each a thread, a device and its frames).
+    hw: Mutex<HashMap<Arc<str>, Option<(Arc<effectcraft_hwcodec::Decoder>, u64)>>>,
+    hw_clock: AtomicU64,
 }
+
+/// Hardware decoders open at once; the least recently used closes for a new one.
+const HW_DECODERS: usize = 6;
+
+/// Turns hardware video decoding off (`0`).
+pub const HW_DECODE_ENV: &str = "EFFECTCRAFT_HW_DECODE";
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
 /// audio. Thread-safe and cheap to clone (clones share decoders and cache).
@@ -284,6 +295,8 @@ impl MediaPool {
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
                 problems: Mutex::default(),
+                hw: Mutex::default(),
+                hw_clock: AtomicU64::new(0),
             }),
         }
     }
@@ -340,6 +353,7 @@ impl MediaPool {
         lock(&self.inner.models).remove(path);
         lock(&self.inner.gifs).remove(path);
         lock(&self.inner.problems).remove(path);
+        lock(&self.inner.hw).remove(path);
         let mut c = lock(&self.inner.cache);
         let keys: Vec<Key> = c.lru.map.keys().filter(|k| &*k.path == path).cloned().collect();
         for k in keys {
@@ -843,13 +857,16 @@ impl Inner {
             }
             Some(mt) => {
                 let (src, turn) = self.opened(path).ok_or_else(|| MediaError::Io(format!("{path}: cannot open")))?;
-                let vf = src
-                    .video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0)))
-                    .map_err(MediaError::from)
-                    .inspect_err(|e| self.note_problem(path, &footage.codec, e))?;
                 // A movie shown turned a quarter (a phone held upright): the footage's size and
                 // the render's are the turned picture's, the decoded frame's are the file's.
                 let side = |(w, h): (u32, u32)| if crate::probe::swaps_sides(turn) { (h, w) } else { (w, h) };
+                let vf = match self.hw_frame(path, footage, mt, side((footage.width, footage.height))) {
+                    Some(vf) => Arc::new(vf),
+                    None => src
+                        .video_frame(FrameRequest::full(filmcraft_time::Tick(mt.0)))
+                        .map_err(MediaError::from)
+                        .inspect_err(|e| self.note_problem(path, &footage.codec, e))?,
+                };
                 // A reduced-resolution render's frame, made at its size (a frame of the footage's
                 // own size only, as the renderer resamples only those).
                 let (w, h) = side(loc.key.size);
@@ -864,9 +881,119 @@ impl Inner {
             }
         }
     }
+
+    /// The movie frame at media time `mt` from the GPU's video decoder, when it can decode the
+    /// file: 8-bit 4:2:0 H.264 or HEVC on disk, opaque as interpreted, whose decoded size is
+    /// `size` (the file's own, unturned). `None`: decode with FilmCraft.
+    fn hw_decoded(&self, path: &Arc<str>, footage: &Footage, mt: Tick, size: (u32, u32)) -> Option<Arc<effectcraft_hwcodec::Frame>> {
+        let c = &footage.codec;
+        let eight_bit_420 = !["10", "422", "4:2:2", "444", "4:4:4"].iter().any(|p| c.contains(p));
+        // (Footage interpreted with alpha keeps FilmCraft, which reads alpha planes; NV12 has none.)
+        if !(c.starts_with("H.264") || c.starts_with("HEVC") || c.starts_with("H.265")) || !eight_bit_420 || footage.alpha != AlphaMode::Ignore {
+            return None;
+        }
+        // A called-off read: FilmCraft's path reports it (`cancellable`).
+        if filmcraft_media::cancel::cancelled() || std::env::var(HW_DECODE_ENV).is_ok_and(|v| v.trim() == "0") || lock(&self.files).contains_key(&**path) {
+            return None;
+        }
+        let now = self.hw_clock.fetch_add(1, Ordering::Relaxed);
+        let dec = {
+            let mut hw = lock(&self.hw);
+            if !hw.contains_key(path) && hw.values().flatten().count() >= HW_DECODERS {
+                let oldest = hw.iter().filter_map(|(p, d)| d.as_ref().map(|d| (d.1, p.clone()))).min();
+                if let Some((_, p)) = oldest {
+                    hw.remove(&p);
+                }
+            }
+            let slot = hw.entry(path.clone()).or_insert_with(|| match effectcraft_hwcodec::Decoder::open(std::path::Path::new(&**path), size.0, size.1) {
+                Ok(d) => Some((Arc::new(d), now)),
+                Err(e) => {
+                    log::info!(target: "effectcraft_media", "{path}: FilmCraft decodes it ({e})");
+                    None
+                }
+            });
+            let (d, used) = slot.as_mut()?;
+            *used = now;
+            d.clone()
+        };
+        let t = (i128::from(mt.0) * 10_000_000 / i128::from(TICKS_PER_SECOND)) as i64;
+        let f = dec.frame_at(t).map_err(|e| log::warn!(target: "effectcraft_media", "{path}: hardware decode: {e}")).ok()?;
+        ((f.width, f.height) == size).then_some(f)
+    }
+
+    /// [`Self::hw_decoded`] as the FilmCraft frame the conversions take.
+    fn hw_frame(&self, path: &Arc<str>, footage: &Footage, mt: Tick, size: (u32, u32)) -> Option<filmcraft_frame::VideoFrame> {
+        use filmcraft_frame::{Chroma, PixelData, VideoFrame};
+        let f = self.hw_decoded(path, footage, mt, size)?;
+        let color = colour_info(&f.colour);
+        let planes = [f.y.clone(), f.u.clone(), f.v.clone()];
+        Some(VideoFrame {
+            width: f.width,
+            height: f.height,
+            data: PixelData::Yuv8 { planes, chroma: Chroma::C420, alpha: None },
+            color,
+            par: (1, 1),
+            pts: filmcraft_time::Tick(mt.0),
+        })
+    }
+
+    /// [`FootageSource::frame_yuv420`]: the hardware decoder's planes of the movie frame at
+    /// source time `t`, for a movie shown as decoded (not turned).
+    fn yuv420_at(&self, footage: &Footage, t: Tick) -> Option<Arc<effectcraft_render::YuvFrame>> {
+        if footage.missing || !footage.has_video || gif_anim::is_animated(footage) {
+            return None;
+        }
+        let loc = Self::locate(footage, t, FloatCurve::default());
+        let mt = loc.media_t?;
+        let path = &loc.key.path;
+        let (_, turn) = self.opened(path)?;
+        if turn != Orientation::NoTransforms {
+            return None;
+        }
+        let f = self.hw_decoded(path, footage, Tick(mt.0), (footage.width, footage.height))?;
+        let c = colour_info(&f.colour);
+        Some(Arc::new(effectcraft_render::YuvFrame {
+            width: f.width,
+            height: f.height,
+            y: f.y.clone(),
+            u: f.u.clone(),
+            v: f.v.clone(),
+            k: crate::convert::yuv_constants(c.matrix, c.range),
+        }))
+    }
+}
+
+/// The hardware decoder's colour description as FilmCraft's.
+fn colour_info(h: &effectcraft_hwcodec::Colour) -> filmcraft_color::ColorInfo {
+    use filmcraft_color::{ColorInfo, Matrix, Primaries, Range, Transfer};
+    ColorInfo {
+        matrix: match h.matrix {
+            effectcraft_hwcodec::Matrix::Bt601 => Matrix::Bt601,
+            effectcraft_hwcodec::Matrix::Bt709 => Matrix::Bt709,
+            effectcraft_hwcodec::Matrix::Bt2020 => Matrix::Bt2020Ncl,
+        },
+        transfer: match h.transfer {
+            effectcraft_hwcodec::Transfer::Bt709 => Transfer::Bt709,
+            effectcraft_hwcodec::Transfer::Srgb => Transfer::Srgb,
+            effectcraft_hwcodec::Transfer::Linear => Transfer::Linear,
+            effectcraft_hwcodec::Transfer::Pq => Transfer::Pq,
+            effectcraft_hwcodec::Transfer::Hlg => Transfer::Hlg,
+        },
+        primaries: match h.primaries {
+            effectcraft_hwcodec::Primaries::Bt709 => Primaries::Bt709,
+            effectcraft_hwcodec::Primaries::Bt601_625 => Primaries::Bt601_625,
+            effectcraft_hwcodec::Primaries::Bt601_525 => Primaries::Bt601_525,
+            effectcraft_hwcodec::Primaries::Bt2020 => Primaries::Bt2020,
+            effectcraft_hwcodec::Primaries::P3D65 => Primaries::P3D65,
+        },
+        range: if h.full_range { Range::Full } else { Range::Limited },
+    }
 }
 
 impl FootageSource for MediaPool {
+    fn frame_yuv420(&self, _item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<effectcraft_render::YuvFrame>> {
+        self.inner.yuv420_at(footage, t)
+    }
     fn set_conform_folder(&self, folder: Option<std::path::PathBuf>) {
         MediaPool::set_conform_folder(self, folder);
     }

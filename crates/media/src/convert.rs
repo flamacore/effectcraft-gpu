@@ -254,6 +254,13 @@ impl Yuv {
     }
 }
 
+/// [`Yuv`] for 8-bit samples as `effectcraft_render::YuvFrame::k`
+/// (`[y_off, y_scale, c_off, c_scale, cr_r, cr_g, cb_g, cb_b]`).
+pub(crate) fn yuv_constants(m: Matrix, range: Range) -> [f32; 8] {
+    let k = Yuv::new(m, range, 8);
+    [k.y_off, k.y_scale, k.c_off, k.c_scale, k.cr_r, k.cr_g, k.cb_g, k.cb_b]
+}
+
 trait Sample: Copy + Send + Sync {
     fn f(self) -> f32;
 }

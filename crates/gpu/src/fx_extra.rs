@@ -188,13 +188,14 @@ fn gaussian_legacy(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         2 => (0.0, 1.0),
         _ => (1.0, 1.0),
     };
-    // Small sigmas use the CPU's sampled kernel (#1939).
-    if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
-        return None;
-    }
     if !ctx.adjustment {
         b.pad(e, (s * 3.0).ceil() as u32)?;
     }
-    b.img = gaussian_blur(e, &b.img, s * kx, s * ky, ctx.adjustment);
+    // Small sigmas sample the kernel, as the CPU does (#1939).
+    b.img = if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
+        crate::effects::gaussian_exact(e, &b.img, s * kx, s * ky, ctx.adjustment)
+    } else {
+        gaussian_blur(e, &b.img, s * kx, s * ky, ctx.adjustment)
+    };
     Some(b)
 }

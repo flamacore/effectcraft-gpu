@@ -29,6 +29,56 @@ impl Backend {
     }
 }
 
+/// An 8-bit BT.709 limited-range 4:2:0 frame, what export's video encoders take: tight planes,
+/// `y` of `width × height`, `u` and `v` of `⌈width / 2⌉ × ⌈height / 2⌉` (see
+/// [`Accelerator::comp_frame_yuv420`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Yuv420 {
+    pub width: u32,
+    pub height: u32,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+impl Yuv420 {
+    /// [`rgba_to_yuv420`] of RGBA8 (the CPU reference of the accelerators' conversion).
+    pub fn from_rgba8(rgba: &[u8], width: u32, height: u32) -> Yuv420 {
+        let mut f = Yuv420 { width, height, ..Default::default() };
+        rgba_to_yuv420(rgba, width as usize, height as usize, &mut f.y, &mut f.u, &mut f.v);
+        f
+    }
+}
+
+/// BT.709 limited-range 8-bit 4:2:0 from RGBA8 (2×2 chroma average; alpha ignored).
+pub fn rgba_to_yuv420(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
+    use rayon::prelude::*;
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    y.resize(w * h, 0);
+    u.resize(cw * ch, 0);
+    v.resize(cw * ch, 0);
+    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
+        let rows = yr.len() / w;
+        let mut acc = vec![(0f32, 0f32, 0f32); cw];
+        for dy in 0..rows {
+            let src = &rgba[(cy * 2 + dy) * w * 4..][..w * 4];
+            for x in 0..w {
+                let (r, g, b) = (src[x * 4] as f32 / 255.0, src[x * 4 + 1] as f32 / 255.0, src[x * 4 + 2] as f32 / 255.0);
+                let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                yr[dy * w + x] = (16.0 + 219.0 * l).round().clamp(1.0, 254.0) as u8;
+                let a = &mut acc[x / 2];
+                a.0 += (b - l) / 1.8556;
+                a.1 += (r - l) / 1.5748;
+                a.2 += 1.0;
+            }
+        }
+        for (cx, a) in acc.iter().enumerate() {
+            ur[cx] = (128.0 + 224.0 * a.0 / a.2).round().clamp(1.0, 254.0) as u8;
+            vr[cx] = (128.0 + 224.0 * a.1 / a.2).round().clamp(1.0, 254.0) as u8;
+        }
+    });
+}
+
 /// One effect of a GPU effect chain (see [`Accelerator::effects`]).
 pub struct FxStep<'x> {
     pub spec: &'static effectcraft_effects::EffectSpec,
@@ -44,6 +94,12 @@ pub trait Accelerator: Send + Sync {
     /// Render a top-level comp frame (what [`Renderer::comp_frame`] returns). `None` = not
     /// handled (the CPU renders it).
     fn comp_frame(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<Image>;
+    /// [`Self::comp_frame`] over the opaque `background`, converted to 8-bit 4:2:0 where it was
+    /// rendered, so only the planes (1.5 bytes a pixel, not 16) come back. `None` = not handled
+    /// (render with [`Self::comp_frame`] and convert on the CPU).
+    fn comp_frame_yuv420(&self, _r: &Renderer, _comp: ItemId, _t: Tick, _background: [f32; 3]) -> Option<Yuv420> {
+        None
+    }
     /// The accelerator implements effect `id` with the CPU effect's semantics.
     fn supports_effect(&self, id: &str) -> bool;
     /// Run a chain of supported effects on `buf`, clamping and quantising to `levels` after

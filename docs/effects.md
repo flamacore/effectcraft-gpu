@@ -5,7 +5,7 @@
 
 EffectCraft ships 307 effects with 3032 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
-- **GPU**: 280 effects also run on the GPU compositor with identical results.
+- **GPU**: 281 effects also run on the GPU compositor with identical results.
 - **32**: 307 effects process 32-bit float (HDR, overbright) pixels without clamping.
 - **Status**: 307 implemented in full, 0 partial (what is missing is listed).
 
@@ -147,7 +147,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Split 2 | `ec.distort.ccsplit2` | 4 | GPU | 32 | Implemented |
 | CC Tiler | `ec.distort.cctiler` | 3 | GPU | 32 | Implemented |
 | Corner Pin | `ec.distort.cornerpin` | 4 | GPU | 32 | Implemented |
-| Detail-preserving Upscale | `ec.distort.upscale` | 4 |  | 32 | Implemented |
+| Detail-preserving Upscale | `ec.distort.upscale` | 4 | GPU | 32 | Implemented |
 | Displacement Map | `ec.distort.displacementmap` | 8 | GPU | 32 | Implemented |
 | Liquify | `ec.distort.liquify` | 13 | GPU | 32 | Implemented |
 | Magnify | `ec.distort.magnify` | 10 | GPU | 32 | Implemented |

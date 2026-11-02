@@ -50,11 +50,14 @@ mod fx_tone;
 mod fx_transition;
 mod fx_vr;
 mod fx_warp;
+mod gate;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod init;
+mod movie;
 mod particles;
 mod three_d;
 mod wgsl_grammar;
+mod yuv;
 
 /// One GPU test at a time in this process: the calling test thread holds a process-wide lock
 /// until it exits (libtest runs every test on a thread of its own). wgpu's OpenGL backend (Mesa
@@ -584,8 +587,9 @@ pub(crate) fn c(r: f64, g: f64, b: f64) -> Value {
 }
 
 #[test]
-fn small_blurs_fall_back_to_the_cpu() {
-    // #1939: small Gaussian sigmas and fractional box radii render on the CPU kernel.
+fn small_blurs_match_the_cpu() {
+    // #1939: small Gaussian sigmas sample the kernel (on the GPU too); fractional box radii
+    // blend two radii on the CPU.
     for (id, vals) in [("ec.blur.gaussian", [("blurriness", n(0.9))]), ("ec.blur.fastbox", [("radius", n(1.5))])] {
         let mut s = Scene::new(BitDepth::Bpc32);
         let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
@@ -594,6 +598,21 @@ fn small_blurs_fall_back_to_the_cpu() {
         s.effect(&mut l, id, &vals);
         s.push(l);
         check(&format!("{id} {vals:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+    }
+    // The sampled kernel at the sizes people use (σ 1.5, just under 3), with repeated edges and
+    // along one axis, at 8 and 32 bpc.
+    for (depth, vals) in [
+        (BitDepth::Bpc32, vec![("blurriness", n(3.0))]),
+        (BitDepth::Bpc8, vec![("blurriness", n(5.9)), ("repeatEdge", Value::Bool(true))]),
+        (BitDepth::Bpc32, vec![("blurriness", n(4.0)), ("dimensions", Value::Enum(1))]),
+    ] {
+        let mut s = Scene::new(depth);
+        let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
+        s.push(bg);
+        let mut l = s.footage(70, 44);
+        s.effect(&mut l, "ec.blur.gaussian", &vals);
+        s.push(l);
+        check(&format!("gaussian {depth:?} {vals:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
     }
 }
 

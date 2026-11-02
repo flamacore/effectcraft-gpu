@@ -19,6 +19,7 @@ effectcraft-psd = { workspace = true }
 effectcraft-svg = { workspace = true }
 effectcraft-pdf = { workspace = true }
 effectcraft-model = { workspace = true }
+effectcraft-hwcodec = { workspace = true }
 filmcraft-codecs = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-isobmff = { workspace = true }

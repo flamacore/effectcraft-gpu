@@ -240,6 +240,29 @@ pub(crate) fn box_passes(e: &mut Enc, img: &GpuImage, rx: &[usize], ry: &[usize]
     cur
 }
 
+/// raster::gaussian_blur_exact: a sampled Gaussian (radius 3σ) along x, then y, with the CPU's
+/// normalised weights (the small sigmas where box passes would step, #1939).
+pub(crate) fn gaussian_exact(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
+    let mut cur = img.clone();
+    for (sigma, vertical) in [(sx, false), (sy, true)] {
+        // (raster::gauss_pass: the identity below 1e-3.)
+        if sigma.is_nan() || sigma <= 1e-3 {
+            continue;
+        }
+        let r = (sigma * 3.0).ceil() as i64;
+        let k: Vec<f64> = (-r..=r).map(|i| (-((i * i) as f64) / (2.0 * sigma * sigma)).exp()).collect();
+        let total: f64 = k.iter().sum();
+        let w: Vec<f32> = k.iter().map(|v| (v / total) as f32).collect();
+        let mut p = Params::default();
+        p.u[0] = [r as u32, u32::from(vertical), u32::from(repeat), 0];
+        let out = e.scratch(cur.width, cur.height);
+        let data = e.data(&w);
+        e.pixels("gauss_pass", &p, &cur, None, &out, Some(&data));
+        cur = out;
+    }
+    cur
+}
+
 /// raster::gaussian_blur (3 box passes per axis).
 pub(crate) fn gaussian_blur(e: &mut Enc, img: &GpuImage, sx: f64, sy: f64, repeat: bool) -> GpuImage {
     let rx = if sx > 0.05 { box_radii(sx, 3) } else { vec![] };
@@ -261,15 +284,16 @@ fn gaussian(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
         return Some(b);
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
-    // Small sigmas use the CPU's sampled kernel (#1939).
-    if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
-        return None;
-    }
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
         b.pad(e, (s * 3.0).ceil() as u32)?;
     }
-    b.img = gaussian_blur(e, &b.img, s * kx, s * ky, repeat || ctx.adjustment);
+    // Small sigmas sample the kernel, as the CPU does (#1939).
+    b.img = if effectcraft_raster::gaussian_is_exact(s * kx, s * ky) {
+        gaussian_exact(e, &b.img, s * kx, s * ky, repeat || ctx.adjustment)
+    } else {
+        gaussian_blur(e, &b.img, s * kx, s * ky, repeat || ctx.adjustment)
+    };
     Some(b)
 }
 

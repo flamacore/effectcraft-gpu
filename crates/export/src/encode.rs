@@ -26,9 +26,29 @@ pub(crate) struct Packet {
     pub(crate) cto: i32,
 }
 
+/// A frame for a video encoder: 8-bit RGBA, or 8-bit 4:2:0 the GPU already converted
+/// ([`crate::Cx::pictures`]).
+pub(crate) enum Picture {
+    Rgba(Vec<u8>),
+    Yuv(effectcraft_render::Yuv420),
+}
+
 pub(crate) trait VideoEncoder {
     fn sample_entry(&self) -> SampleEntry;
     fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>>;
+    /// Whether [`Self::encode_yuv420`] takes 8-bit 4:2:0 frames.
+    fn takes_yuv420(&self) -> bool {
+        false
+    }
+    fn encode_yuv420(&mut self, _yuv: &effectcraft_render::Yuv420, _index: u64) -> Result<Vec<Packet>> {
+        Err(ExportError::Encode("this encoder takes RGBA frames".into()))
+    }
+    fn encode_picture(&mut self, pic: &Picture, index: u64) -> Result<Vec<Packet>> {
+        match pic {
+            Picture::Rgba(px) => self.encode(px, index),
+            Picture::Yuv(y) => self.encode_yuv420(y, index),
+        }
+    }
     fn flush(&mut self) -> Result<Vec<Packet>>;
     /// Edit-list media start (B-frame delay) in the track timescale.
     fn media_start(&self) -> Option<i64> {
@@ -79,6 +99,15 @@ impl VideoEncoder for H264 {
         let ps = self.enc.try_encode(&frame, index as i64 * self.rate.den).map_err(enc)?;
         Ok(self.packets(ps))
     }
+    fn takes_yuv420(&self) -> bool {
+        true
+    }
+    fn encode_yuv420(&mut self, yuv: &effectcraft_render::Yuv420, index: u64) -> Result<Vec<Packet>> {
+        let (w, cw) = (self.w as usize, (self.w as usize).div_ceil(2));
+        let frame = filmcraft_h264enc::YuvFrame { y: &yuv.y, u: &yuv.u, v: &yuv.v, y_stride: w, uv_stride: cw };
+        let ps = self.enc.try_encode(&frame, index as i64 * self.rate.den).map_err(enc)?;
+        Ok(self.packets(ps))
+    }
     fn flush(&mut self) -> Result<Vec<Packet>> {
         let ps = self.enc.flush();
         Ok(self.packets(ps))
@@ -88,33 +117,7 @@ impl VideoEncoder for H264 {
     }
 }
 
-/// BT.709 limited-range 8-bit 4:2:0 from RGBA8 (2×2 chroma average; alpha ignored).
-pub(crate) fn rgba_to_yuv420(rgba: &[u8], w: usize, h: usize, y: &mut Vec<u8>, u: &mut Vec<u8>, v: &mut Vec<u8>) {
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-    y.resize(w * h, 0);
-    u.resize(cw * ch, 0);
-    v.resize(cw * ch, 0);
-    y.par_chunks_mut(w * 2).zip(u.par_chunks_mut(cw).zip(v.par_chunks_mut(cw))).enumerate().for_each(|(cy, (yr, (ur, vr)))| {
-        let rows = yr.len() / w;
-        let mut acc = vec![(0f32, 0f32, 0f32); cw];
-        for dy in 0..rows {
-            let src = &rgba[(cy * 2 + dy) * w * 4..][..w * 4];
-            for x in 0..w {
-                let (r, g, b) = (src[x * 4] as f32 / 255.0, src[x * 4 + 1] as f32 / 255.0, src[x * 4 + 2] as f32 / 255.0);
-                let l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-                yr[dy * w + x] = (16.0 + 219.0 * l).round().clamp(1.0, 254.0) as u8;
-                let a = &mut acc[x / 2];
-                a.0 += (b - l) / 1.8556;
-                a.1 += (r - l) / 1.5748;
-                a.2 += 1.0;
-            }
-        }
-        for (cx, a) in acc.iter().enumerate() {
-            ur[cx] = (128.0 + 224.0 * a.0 / a.2).round().clamp(1.0, 254.0) as u8;
-            vr[cx] = (128.0 + 224.0 * a.1 / a.2).round().clamp(1.0, 254.0) as u8;
-        }
-    });
-}
+pub(crate) use effectcraft_render::rgba_to_yuv420;
 
 // ---------------------------------------------------------------- ProRes
 
@@ -256,23 +259,38 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
         Channels::Rgba if !matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) => Channels::Rgb,
         c => c,
     };
+    use effectcraft_hwcodec::Codec;
+    use effectcraft_project::render_queue::{CodecProfile, RateControlMode};
+    let om = job.output;
+    // The GPU's encoder where it has one (8-bit, bitrate-controlled), the software one otherwise.
+    let hw_hevc = || {
+        (om.codec.profile == CodecProfile::Main && om.codec.rate_control == RateControlMode::Bitrate)
+            .then(|| crate::hw::Hw::new(Codec::Hevc, w, h, rate, om.bitrate_kbps.max(50), om.keyint(rate.as_f64())))
+            .flatten()
+    };
     let mut venc: Box<dyn VideoEncoder> = match fmt {
-        OutputFormat::H264 => Box::new(H264::new(w, h, rate, job.output.bitrate_kbps)?),
-        OutputFormat::Hevc => Box::new(crate::hevc_av1::Hevc::new(w, h, rate, job.output)?),
+        OutputFormat::H264 => match crate::hw::Hw::new(Codec::H264, w, h, rate, om.bitrate_kbps.max(100), (rate.as_f64() * 2.0).round().max(1.0) as u32) {
+            Some(e) => Box::new(e),
+            None => Box::new(H264::new(w, h, rate, om.bitrate_kbps)?),
+        },
+        OutputFormat::Hevc => match hw_hevc() {
+            Some(e) => Box::new(e),
+            None => Box::new(crate::hevc_av1::Hevc::new(w, h, rate, job.output)?),
+        },
         OutputFormat::Av1 => Box::new(crate::hevc_av1::Av1::new(w, h, rate, job.output)?),
         OutputFormat::Uncompressed => Box::new(crate::uncompressed::Raw::new(w, h, channels == Channels::Rgba)?),
         _ => Box::new(ProRes::new(w, h, job.output.prores_profile, if channels == Channels::Alpha { Channels::Rgb } else { channels })),
     };
     let brand = if matches!(fmt, OutputFormat::ProRes | OutputFormat::Uncompressed) { Brand::Mov } else { Brand::Mp4 };
     let batch = batch_size();
-    let render = |_: u64, img: effectcraft_raster::Image| -> Vec<u8> { job.pixels(&img, comp, channels, w, h) };
+    let yuv = venc.takes_yuv420();
 
     // Encode the first batch before creating tracks: encoders finalise their config on frame 1.
     let first_end = batch.min(st.total);
-    let first: Vec<Vec<u8>> = job.frames(comp, (0..first_end).collect(), render).await;
+    let first = job.pictures(comp, (0..first_end).collect(), channels, w, h, yuv).await;
     let mut pending = Vec::new();
     for (k, px) in first.iter().enumerate() {
-        pending.extend(venc.encode(px, k as u64)?);
+        pending.extend(venc.encode_picture(px, k as u64)?);
     }
     drop(first);
     st.advance(first_end)?;
@@ -355,14 +373,26 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     let frame_end_time = |k: u64| -> Tick { if k >= total { span_end } else { job.settings.frame_time(comp, k) } };
     write_video(&mut mux, pending)?;
     write_audio_until(&mut mux, frame_end_time(first_end), &mut cursor)?;
+    // 4:2:0 frames from the GPU: the next batch renders on a thread of its own while this one
+    // encodes, so the GPU, the decoder and the encoder work at once. (RGBA batches, up to
+    // 16 × 33 MB at 4K, stay one at a time; the browser has no threads.)
+    let overlap = yuv && channels == Channels::Rgb && job.gpu_yuv420() && cfg!(not(target_arch = "wasm32"));
+    let mut next = None;
     let mut i = first_end;
     while i < total {
         let end = (i + batch).min(total);
-        let frames: Vec<Vec<u8>> = job.frames(comp, (i..end).collect(), render).await;
-        for (k, px) in frames.iter().enumerate() {
-            let ps = venc.encode(px, i + k as u64)?;
-            write_video(&mut mux, ps)?;
-        }
+        let frames = match next.take() {
+            Some(f) => f,
+            None => job.pictures(comp, (i..end).collect(), channels, w, h, yuv).await,
+        };
+        let ahead = (overlap && end < total).then(|| end..(end + batch).min(total));
+        let (encoded, rendered) = std::thread::scope(|sc| {
+            let render = ahead.map(|ks| sc.spawn(move || effectcraft_render::passes::block_on(job.pictures(comp, ks.collect(), channels, w, h, yuv))));
+            let encoded = frames.iter().enumerate().try_for_each(|(k, px)| write_video(&mut mux, venc.encode_picture(px, i + k as u64)?));
+            (encoded, render.map(|r| r.join().map_err(|_| ExportError::Encode("frame rendering stopped".into()))))
+        });
+        encoded?;
+        next = rendered.transpose()?;
         write_audio_until(&mut mux, frame_end_time(end), &mut cursor)?;
         st.advance(end - i)?;
         i = end;

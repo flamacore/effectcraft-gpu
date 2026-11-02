@@ -96,6 +96,64 @@ pub use wgpu;
 
 use crate::context::Enc;
 
+/// Viewer and export frames rendered on the GPU at once (the viewer renders on up to 16
+/// threads): each holds its own working textures, and the pool keeps released ones until every
+/// encoder open meanwhile is submitted, so 16 frames of a heavy comp took 9 GB and exhausted a
+/// 16 GB card, retiring the compositor. Two keep one frame recording while the other runs.
+const FRAMES_AT_ONCE: usize = 2;
+
+/// A frame waits at most this long for its turn, then goes ahead anyway: a frame thread can be
+/// waiting inside another frame's parallel work (rayon runs queued jobs while it waits), where
+/// its turn would never come.
+const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Admits [`FRAMES_AT_ONCE`] whole frames ([`Gpu::render_display`], 4:2:0 export frames). The
+/// GPU work inside a frame (precomps and effects of layers the CPU renders) is not gated.
+#[derive(Default)]
+struct Gate {
+    busy: std::sync::Mutex<usize>,
+    free: std::sync::Condvar,
+}
+
+thread_local! {
+    static IN_FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A frame's place at the GPU, given back on drop.
+struct Slot<'a>(Option<&'a Gate>);
+
+impl Gate {
+    fn enter(&self) -> Slot<'_> {
+        // (The browser renders on one thread: nothing to wait for, and it can't block.)
+        if cfg!(target_arch = "wasm32") || IN_FRAME.get() {
+            return Slot(None);
+        }
+        let deadline = web_time::Instant::now() + TURN_WAIT;
+        let mut busy = self.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *busy >= FRAMES_AT_ONCE {
+            let left = deadline.saturating_duration_since(web_time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            busy = self.free.wait_timeout(busy, left).unwrap_or_else(std::sync::PoisonError::into_inner).0;
+        }
+        *busy += 1;
+        IN_FRAME.set(true);
+        Slot(Some(self))
+    }
+}
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        if let Some(g) = self.0 {
+            IN_FRAME.set(false);
+            let mut busy = g.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            *busy = busy.saturating_sub(1);
+            g.free.notify_one();
+        }
+    }
+}
+
 /// The GPU compositor (cheap to clone; one device shared by all clones).
 #[derive(Clone)]
 pub struct Gpu {
@@ -104,6 +162,7 @@ pub struct Gpu {
     auto: Arc<effectcraft_render::AutoPick>,
     /// (comp, reason) pairs already warned about when the GPU declined a frame.
     declined: Arc<std::sync::Mutex<std::collections::HashSet<(u64, String)>>>,
+    gate: Arc<Gate>,
 }
 
 /// A viewer frame left on the GPU: premultiplied RGBA8 (`wgpu::TextureFormat::Rgba8Unorm`) with
@@ -135,7 +194,7 @@ impl Gpu {
     }
 
     pub fn from_context(ctx: GpuContext) -> Gpu {
-        Gpu { ctx: Arc::new(ctx), auto: Default::default(), declined: Default::default() }
+        Gpu { ctx: Arc::new(ctx), auto: Default::default(), declined: Default::default(), gate: Default::default() }
     }
 
     /// A device of its own without blocking, with deferred readbacks (a browser worker, see
@@ -188,10 +247,19 @@ impl Gpu {
     /// readback unless a CPU fallback step needs one). `None` = render on the CPU.
     pub fn render_display(&self, r: &Renderer, comp: ItemId, t: Tick) -> Option<DisplayFrame> {
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
+        let slot = self.gate.enter();
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
         let texture = e.display(&img);
         e.submit();
+        drop(e);
+        // The slot holds the frame's working textures until the GPU is done with them (the
+        // frame can't be shown sooner anyway).
+        #[cfg(not(target_arch = "wasm32"))]
+        if slot.0.is_some() {
+            self.wait();
+        }
+        drop(slot);
         // Reject failures observed during rendering/submission before publishing the frame.
         // A later device fault still requires the presentation host's lifecycle handling.
         self.ctx.check_health().map_err(|e| log::error!("gpu display: {e}")).ok()?;
@@ -337,6 +405,18 @@ impl Accelerator for Gpu {
             }
         }
         img
+    }
+
+    fn comp_frame_yuv420(&self, r: &Renderer, comp: ItemId, t: Tick, background: [f32; 3]) -> Option<effectcraft_render::Yuv420> {
+        self.ctx.check_health().ok()?;
+        // Deferred readbacks (a browser worker) take the usual path.
+        if !self.ctx.can_readback() || self.ctx.deferred.is_some() {
+            return None;
+        }
+        let _slot = self.gate.enter();
+        let mut e = Enc::new(&self.ctx);
+        let img = walk::render(&mut e, r, comp, t)?;
+        e.yuv420(&img, background)
     }
 
     fn supports_effect(&self, id: &str) -> bool {

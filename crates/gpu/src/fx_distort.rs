@@ -29,10 +29,13 @@ pub(crate) const KERNELS: &[&str] = &[
     "dst_mosaic_sharp",
     "dst_findedges",
     "dst_emboss",
+    "dst_upscale",
+    "dst_detail",
 ];
 
 /// Effect ids implemented here.
 pub(crate) const IDS: &[&str] = &[
+    "ec.distort.upscale",
     "ec.distort.turbulentdisplace",
     "ec.distort.displacementmap",
     "ec.distort.wavewarp",
@@ -49,6 +52,7 @@ pub(crate) const IDS: &[&str] = &[
 /// Run effect `id` (one of [`IDS`]); `None` = this parameter combination runs on the CPU.
 pub(crate) fn apply(e: &mut Enc, id: &str, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     match id {
+        "ec.distort.upscale" => upscale(e, ctx, b),
         "ec.distort.turbulentdisplace" => turbulent(e, ctx, b),
         "ec.distort.displacementmap" => displacement_map(e, ctx, b),
         "ec.distort.wavewarp" => wave_warp(e, ctx, b),
@@ -412,4 +416,54 @@ fn emboss(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let mut p = Params::default();
     p.f[0] = [dx as f32, dy as f32, ctx.params.f("contrast") as f32 / 100.0, ctx.params.f("blend") as f32 / 100.0];
     run(e, "dst_emboss", &p, b, None)
+}
+
+// ---------------------------------------------------------------- Detail-preserving Upscale (distort3.rs)
+
+/// `distort3::upscale`: Catmull-Rom bicubic up by Scale (the layer grows, or an adjustment
+/// layer's comp scales in place about the layer centre), alpha bilinear or bicubic, Reduce
+/// Noise as a blur before and Detail as an unsharp mask after, both box-pass Gaussians as on
+/// the CPU.
+fn upscale(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
+    let k = (ctx.params.f("scale") / 100.0).clamp(1.0, 10.0);
+    if (k - 1.0).abs() < 1e-9 {
+        return Some(b);
+    }
+    let detail = (ctx.params.f("detail") / 100.0) as f32;
+    let noise = ctx.params.f("reduceNoise") / 100.0;
+    let src = if noise > 0.0 { crate::effects::gaussian_blur(e, &b.img, noise * 1.5, noise * 1.5, true) } else { b.img.clone() };
+    let lc = [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5];
+    let mut p = Params::default();
+    p.u[0] = [u32::from(ctx.params.e("alpha") == 0), u32::from(ctx.adjustment), 0, 0];
+    let mut out = if ctx.adjustment {
+        let c = b.to_px(lc);
+        p.f[0] = [k as f32, k as f32, c.0 as f32, c.1 as f32];
+        let out = e.scratch(src.width, src.height);
+        e.pixels("dst_upscale", &p, &src, None, &out, None);
+        out
+    } else {
+        let (w, h) = (f64::from(src.width), f64::from(src.height));
+        let w2 = ((w * k).round() as u32).clamp(1, 16384);
+        let h2 = ((h * k).round() as u32).clamp(1, 16384);
+        if !e.g.fits(w2, h2) {
+            return None;
+        }
+        let (kx, ky) = (f64::from(w2) / w, f64::from(h2) / h);
+        p.f[0] = [kx as f32, ky as f32, 0.0, 0.0];
+        let out = e.scratch(w2, h2);
+        e.pixels("dst_upscale", &p, &src, None, &out, None);
+        let c = [lc[0] * b.scale, lc[1] * b.scale];
+        b.offset = [b.offset[0] * kx + c[0] * (kx - 1.0), b.offset[1] * ky + c[1] * (ky - 1.0)];
+        out
+    };
+    if detail > 0.0 {
+        let blur = crate::effects::gaussian_blur(e, &out, 0.6 * k, 0.6 * k, true);
+        let mut q = Params::default();
+        q.f[0][0] = detail;
+        let sharp = e.scratch(out.width, out.height);
+        e.pixels("dst_detail", &q, &out, Some(&blur), &sharp, None);
+        out = sharp;
+    }
+    b.img = out;
+    Some(b)
 }

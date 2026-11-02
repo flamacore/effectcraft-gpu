@@ -33,6 +33,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("opusenc", 0),
     ("hevcenc", 0),
     ("av1enc", 0),
+    ("hwcodec", 0),
     ("raster", 1),
     ("keyframe", 1),
     ("path", 1),

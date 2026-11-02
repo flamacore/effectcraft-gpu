@@ -22,6 +22,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L0 | `opusenc` | Opus encoder: RFC 6716 SILK (NB/MB/WB), hybrid (SWB/FB) and CELT (FB) modes chosen by bitrate and application (audio / voice), 48 kHz 20 ms packets, mono/stereo, and the RFC 7845 `OpusHead`, for WebM export audio |
 | L0 | `hevcenc` | HEVC (H.265) encoder from ITU-T H.265: Main / Main 10 4:2:0, IDR + P slices (quarter-pel motion, merge/AMVP), CABAC, deblocking, bitrate or constant-QP rate control, for MP4 (`hvc1`) export |
 | L0 | `av1enc` | AV1 encoder from the AV1 bitstream specification: Main profile 8/10-bit 4:2:0, key + inter frames (quarter-pel motion), deblocking, for MP4 (`av01`) and WebM export |
+| L0 | `hwcodec` | Hardware H.264 / HEVC encoding and decoding through the platform's media framework (Windows: Media Foundation, driving NVENC / NVDEC, AMF / VCN or Quick Sync); unavailable elsewhere. The one crate allowed `unsafe` (COM / FFI) |
 | L1 | `raster` | Premultiplied float images, sampling, affine and projective warps, blurs, compositing (parallel with rayon) |
 | L1 | `keyframe` | Animated values, keyframes with temporal ease and spatial Bezier, roving, hold, velocity |
 | L1 | `segment` | Swappable trained models for Roto Brush and face tracking: the `MaskModel` and `FaceModel` interfaces, a registry of open-licensed models (authors, licence, URL, size, SHA-256), PyTorch checkpoint and TensorFlow Lite readers (with an interpreter), SHA-256, MobileSAM (TinyViT + Segment Anything decoder) and MediaPipe Face Landmarker (BlazeFace + Face Mesh V2) on rayon and ndarray's safe GEMM |
@@ -178,6 +179,32 @@ is nearer, and composited from the farthest to the nearest through the 2D path (
 itself drawn through the camera). **Environment Light Background** layers (Layer ▸ Light) draw
 their equirectangular image behind the run, looked up by each pixel's view direction. Not yet:
 collapsed 3D precomps (drawn flattened), morph targets, extruded strokes.
+
+**The GPU frame path** (Mercury GPU Acceleration, Windows with `hwcodec`). A frame stays on the
+GPU from decoder to encoder; only 8-bit 4:2:0 planes (1.5 bytes a pixel) cross the bus, never the
+compositor's 16-byte float pixels.
+
+- *Decode:* movies (8-bit 4:2:0 H.264 / HEVC, opaque as interpreted) decode on the platform
+  decoder (`media::MediaPool`, one per file, at most six open): Media Foundation's CPU decoder up to
+  1080p, the GPU's above, where each is faster. A thread per decoder keeps four frames decoded
+  past the furthest request, so playback and export find the next frame ready
+  (`hwcodec::ahead`). Requests from parallel frames may be far apart (a looping layer, a clip
+  used twice): a seek keeps the frames already decoded, and a request it left behind seeks back
+  once that seek has served the request that made it. Other footage, and every build without
+  `hwcodec`, decodes with FilmCraft as before.
+- *Frames in flight:* the compositor renders two viewer or 4:2:0 export frames at once
+  (`gpu::FRAMES_AT_ONCE`) whatever the number of frame threads, and a viewer frame keeps its
+  turn until the GPU has finished it: every frame holds its own working textures.
+- *Footage on the GPU:* a footage layer whose source is just its frame
+  (`Renderer::plain_movie_source`) is built in a kernel from the decoder's planes
+  (`FootageSource::frame_yuv420`, `gpu::walk::draw_movie`; the reduced-resolution frame at half
+  size as the media layer makes it), then converted, quantised and run through its effects there:
+  no float frame is made on the CPU or uploaded.
+- *Encode:* H.264 / HEVC export takes 4:2:0 converted on the GPU (`Accelerator::comp_frame_yuv420`)
+  into the GPU's encoder (`export::hw`, 8-bit, bitrate rate control, no B-frames), and the next
+  batch of frames renders while one encodes. The software encoders take the same planes.
+- *Switches:* `EFFECTCRAFT_HW_DECODE=0` / `EFFECTCRAFT_HW_ENCODE=0` turn the hardware codecs off;
+  `EFFECTCRAFT_MF_D3D=0` / `1` forces Media Foundation's CPU / the GPU's decoder.
 
 A **layer cache** keeps each layer's finished pixels (source, masks and effects) keyed by a hash of
 its evaluated inputs, excluding the transform. Static and transform-only layers render once;

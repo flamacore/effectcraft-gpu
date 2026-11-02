@@ -306,6 +306,15 @@ impl<'a> Renderer<'a> {
         self.comp_frame_cpu(comp_id, t)
     }
 
+    /// [`Self::comp_frame`] over `background` as 8-bit 4:2:0, rendered and converted by the
+    /// active accelerator (export's fast path). `None`: use [`Self::comp_frame`].
+    pub fn comp_frame_yuv420(&self, comp_id: ItemId, t: Tick, background: [f32; 3]) -> Option<super::accel::Yuv420> {
+        if self.depth != 0 {
+            return None;
+        }
+        self.active_accel()?.comp_frame_yuv420(self, comp_id, t, background)
+    }
+
     /// The Auto timing history and key for a top-level frame of `comp` (`None` unless the
     /// backend is [`Backend::Auto`] and the accelerator keeps history).
     pub fn frame_auto(&self, a: &'a dyn Accelerator, comp: ItemId, display: bool) -> Option<(&'a AutoPick, AutoKey)> {
@@ -664,6 +673,38 @@ impl<'a> Renderer<'a> {
             LayerSource::Shape => layer.props.sub("contents").map(|c| self.authored(shapes::render(ctx, layer, c, self.raster_scale(ctx, layer)))),
             _ => None,
         }
+    }
+
+    /// A footage layer whose source buffer is just its movie frame: decoded, converted from the
+    /// footage's colour profile ([`color::Pipeline::media_in`]) and quantised, with nothing else
+    /// between the decoder and the effects (no masks, proxy, fields, frame blending, Interpret
+    /// Footage alpha or linear light, vector rasterising or content motion blur): the item, the
+    /// footage, the source time and, when this render is reduced enough that footage is
+    /// resampled ([`FootageSource::frame_at_size`]), the size the frame is made at (buffer scale
+    /// = the render's; otherwise the footage's own size at buffer scale 1). An accelerator can
+    /// rebuild that buffer from the decoder's planes ([`FootageSource::frame_yuv420`]) instead
+    /// of uploading the CPU's float frame.
+    pub fn plain_movie_source(&self, ctx: &EvalCtx, layer: &Layer) -> Option<(ItemId, &'a Footage, Tick, Option<(u32, u32)>)> {
+        let LayerSource::Footage { item } = layer.source else { return None };
+        let it = self.project.item(item)?;
+        let ItemKind::Footage(f) = &it.kind else { return None };
+        if !f.has_video
+            || f.kind != FootageKind::Video
+            || f.fields != effectcraft_project::FieldOrder::Off
+            || f.invert_alpha
+            || f.linear_light_applies()
+            || is_vector_footage(f)
+            || self.proxy_for(item).is_some()
+            || layer.masks().is_some_and(|m| !m.children.is_empty())
+            || self.content_times(ctx, layer).is_some()
+        {
+            return None;
+        }
+        let lt = ctx.source_time(layer);
+        if frame_blend_mode(ctx, layer) != FrameBlend::Off && frame_position(lt, f.frame_rate).1 > 1e-6 {
+            return None;
+        }
+        Some((item, f, lt, self.reduced_size(f.width, f.height)))
     }
 
     /// The proxy footage used for `item` under this render's Proxy Use, if any.

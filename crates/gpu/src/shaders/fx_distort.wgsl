@@ -552,3 +552,107 @@ fn dst_emboss(@builtin(global_invocation_id) gid: vec3<u32>) {
     let al = px.w;
     textureStore(out, p, dst_blend_with(px, vec4<f32>(v * al, v * al, v * al, al), P.f[0].w));
 }
+
+// ---------------------------------------------------------------- Detail-preserving Upscale (distort3.rs)
+
+// Catmull-Rom weight.
+fn up_cubic_w(t0: f32) -> f32 {
+    let t = abs(t0);
+    if (t < 1.0) {
+        return 1.5 * t * t * t - 2.5 * t * t + 1.0;
+    }
+    if (t < 2.0) {
+        return -0.5 * t * t * t + 2.5 * t * t - 4.0 * t + 2.0;
+    }
+    return 0.0;
+}
+
+fn up_clamped(x: i32, y: i32) -> vec4<f32> {
+    let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1);
+    return textureLoad(src, clamp(vec2<i32>(x, y), vec2<i32>(0), last), 0);
+}
+
+// distort3::bicubic: 4 × 4 Catmull-Rom with clamped edges; alpha to 0..1, colour not below 0.
+fn up_bicubic(x: f32, y: f32) -> vec4<f32> {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let wx = vec4<f32>(up_cubic_w(1.0 + tx), up_cubic_w(tx), up_cubic_w(1.0 - tx), up_cubic_w(2.0 - tx));
+    let wy = vec4<f32>(up_cubic_w(1.0 + ty), up_cubic_w(ty), up_cubic_w(1.0 - ty), up_cubic_w(2.0 - ty));
+    var o = vec4<f32>(0.0);
+    for (var j = 0; j < 4; j++) {
+        for (var i = 0; i < 4; i++) {
+            o += up_clamped(i32(x0) - 1 + i, i32(y0) - 1 + j) * (wx[i] * wy[j]);
+        }
+    }
+    return vec4<f32>(max(o.xyz, vec3<f32>(0.0)), clamp(o.w, 0.0, 1.0));
+}
+
+// Image::sample_bilinear_clamped's alpha.
+fn up_bilinear_alpha(x: f32, y: f32) -> f32 {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let a = up_clamped(i32(x0), i32(y0)).w;
+    let b = up_clamped(i32(x0) + 1, i32(y0)).w;
+    let c = up_clamped(i32(x0), i32(y0) + 1).w;
+    let d = up_clamped(i32(x0) + 1, i32(y0) + 1).w;
+    let top = a + (b - a) * tx;
+    let bot = c + (d - c) * tx;
+    return top + (bot - top) * ty;
+}
+
+// u[0] = (bilinear alpha, in place); f[0] = (scale x, scale y, centre x, centre y): resized,
+// output pixel (x, y) reads the source at ((x + ½) / kx, (y + ½) / ky); in place, at the centre
+// plus the offset from it / k, transparent outside the source.
+@compute @workgroup_size(16, 16)
+fn dst_upscale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let k = P.f[0];
+    var sx: f32;
+    var sy: f32;
+    if (P.u[0].y == 1u) {
+        sx = k.z + (f32(p.x) + 0.5 - k.z) / k.x;
+        sy = k.w + (f32(p.y) + 0.5 - k.w) / k.y;
+        let size = vec2<f32>(textureDimensions(src));
+        if (sx < 0.0 || sy < 0.0 || sx > size.x || sy > size.y) {
+            textureStore(out, p, vec4<f32>(0.0));
+            return;
+        }
+    } else {
+        sx = (f32(p.x) + 0.5) / k.x;
+        sy = (f32(p.y) + 0.5) / k.y;
+    }
+    var q = up_bicubic(sx, sy);
+    if (P.u[0].x == 1u) {
+        let a = up_bilinear_alpha(sx, sy);
+        let r = select(0.0, a / q.w, q.w > 1e-6);
+        q = vec4<f32>(q.xyz * r, a);
+    }
+    textureStore(out, p, q);
+}
+
+// Detail: unsharp mask of `src` against its blur `aux`, f[0].x = Detail (0–1):
+// c + (c − blur) · detail · 1.5, kept in 0..max(alpha, c).
+@compute @workgroup_size(16, 16)
+fn dst_detail(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = out_dims();
+    let p = vec2<i32>(gid.xy);
+    if (p.x >= dims.x || p.y >= dims.y) {
+        return;
+    }
+    let c = textureLoad(src, p, 0);
+    let q = textureLoad(aux, p, 0);
+    let v = c.xyz + (c.xyz - q.xyz) * P.f[0].x * 1.5;
+    textureStore(out, p, vec4<f32>(clamp(v, vec3<f32>(0.0), max(max(vec3<f32>(c.w), c.xyz), vec3<f32>(0.0))), c.w));
+}

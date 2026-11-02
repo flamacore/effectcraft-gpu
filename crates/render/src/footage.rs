@@ -15,10 +15,33 @@ pub enum FloatCurve {
     Linear,
 }
 
+/// A movie frame as the decoder made it: 8-bit 4:2:0 planes (`y` of `width × height`, `u` and
+/// `v` of half that each way) and the constants that turn them into the encoded RGB
+/// [`FootageSource::frame`] returns, as the media layer's conversion applies them: for samples
+/// `Y`, `Cb`, `Cr` (0–255; chroma upsampled bilinearly from co-sited centres), `y = (Y − y_off)
+/// · y_scale`, `u = (Cb − c_off) · c_scale`, `v` likewise, then R = y + cr_r·v,
+/// G = y − cr_g·v − cb_g·u, B = y + cb_b·u, each clamped to 0..1, alpha 1.
+#[derive(Clone, Debug)]
+pub struct YuvFrame {
+    pub width: u32,
+    pub height: u32,
+    pub y: Arc<Vec<u8>>,
+    pub u: Arc<Vec<u8>>,
+    pub v: Arc<Vec<u8>>,
+    /// `[y_off, y_scale, c_off, c_scale, cr_r, cr_g, cb_g, cb_b]`.
+    pub k: [f32; 8],
+}
+
 /// Supplies decoded footage frames (implemented by the media layer).
 pub trait FootageSource: Send + Sync {
     /// The frame of `item` at source time `t`, straight from the file (any size).
     fn frame(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<Image>>;
+    /// [`FootageSource::frame`] of an opaque movie as its decoder's 4:2:0 planes, when the
+    /// source has the frame that way (the GPU's video decoder), so an accelerator can upload
+    /// 1.5 bytes a pixel and convert them itself. `None`: use [`FootageSource::frame`].
+    fn frame_yuv420(&self, _item: ItemId, _footage: &Footage, _t: Tick) -> Option<Arc<YuvFrame>> {
+        None
+    }
     /// [`FootageSource::frame`] for a render that shows it at `width` × `height`, at most half its
     /// size: either that frame or, when the source can make it more cheaply than the whole frame
     /// (movies, see `effectcraft-media`), the frame already resampled to that size as
@@ -121,6 +144,9 @@ impl FootageSource for CancellableFootage<'_> {
     }
     fn frame_at_size(&self, item: ItemId, footage: &Footage, t: Tick, width: u32, height: u32) -> Option<Arc<Image>> {
         self.read(|| self.inner.frame_at_size(item, footage, t, width, height))
+    }
+    fn frame_yuv420(&self, item: ItemId, footage: &Footage, t: Tick) -> Option<Arc<YuvFrame>> {
+        self.read(|| self.inner.frame_yuv420(item, footage, t))
     }
     fn audio(&self, item: ItemId, footage: &Footage, t: Tick, frames: usize, rate: u32) -> Option<Vec<f32>> {
         self.inner.audio(item, footage, t, frames, rate)

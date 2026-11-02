@@ -23,7 +23,8 @@
 //! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
-//!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
+//!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half; --gpu --play N: N consecutive frames,
+//!     CPU vs GPU vs the GPU viewer path, with footage decoding every frame)
 //! effectcraft-cli bench --ops [--small] [--layers N] [--comps N] [--footage N]   everyday-operation timings
 //!     on a large generated project (open, save, auto-save, undo/redo, timeline, Project panel)
 //! effectcraft-cli script FILE.jsx [F.ecproj] | --eval CODE    run an After Effects-style script
@@ -115,7 +116,8 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   render/render-frame --template T.ectemplate [--values V.json]   render one template instance
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
-                                           --gpu compares CPU and GPU ms/frame for every comp at Full and Half
+                                           --gpu compares CPU and GPU ms/frame for every comp at Full and Half;
+                                           --gpu --play N: N consecutive frames, CPU vs GPU vs the GPU viewer path
   bench --ops [--small] [--layers N] [--comps N] [--footage N]
                                            everyday operations on a large generated project: startup, open,
                                            save, auto-save, edits + undo/redo, timeline, Project panel
@@ -1218,6 +1220,11 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         }
     };
     let project = &project;
+    if let Some(frames) = args.num("--play")? {
+        note!("GPU: {} — {} consecutive frames at Full (mean ms/frame)", effectcraft_render::Accelerator::name(&gpu), frames.max(1.0) as usize);
+        bench_gpu_play(project, s, &gpu, &comps, frames.max(1.0) as usize, args.num("--time")?.unwrap_or(0.0));
+        return Ok(());
+    }
     note!("GPU: {} — median of {n} runs (ms/frame)", effectcraft_render::Accelerator::name(&gpu));
     note!(
         "{:<28} {:>5} {:>10} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>9} {:>9} {:>11}",
@@ -1304,6 +1311,54 @@ fn bench_gpu(s: &Session, args: &Args) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+/// `bench --gpu --play N`: N consecutive frames per comp at Full, as playback renders them (one
+/// layer cache across the frames, so footage decodes every frame): the CPU, the GPU read back
+/// to the CPU (what export gets) and the GPU viewer path (no readback). "src" is the CPU run's
+/// time in layer sources outside effects (footage decode and conversion). Pick N above the
+/// footage cache's capacity (~30 frames at 1080p) so every run decodes.
+fn bench_gpu_play(project: &effectcraft_engine::project::Project, s: &Session, gpu: &effectcraft_gpu::Gpu, comps: &[ItemId], n: usize, from: f64) {
+    use effectcraft_render::Backend;
+    note!("{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}   view: {:>7} {:>7}", "comp", "src", "cpu", "gpu", "gpu view", "view fps", "record", "gpu");
+    for &cid in comps {
+        let Some(comp) = project.comp(cid) else { continue };
+        let name = project.item(cid).map(|i| i.name.clone()).unwrap_or_default();
+        let f0 = comp.frame_rate.frame_at(Tick::from_seconds_f64(from));
+        // The view path split: the render (footage decoding, recording, submission and the
+        // wait the viewer's frame thread makes for the GPU) and any GPU work left after it.
+        let mut split = [0.0f64; 2];
+        let mut run = |backend: Backend, view: bool, prof: Option<&std::sync::Mutex<Vec<LayerTiming>>>| {
+            let cache = LayerCache::default();
+            let t0 = std::time::Instant::now();
+            for i in 0..n as i64 {
+                let mut r = Renderer::new(project, s.footage.as_ref(), RenderOpts { scale: 1.0, backend, ..Default::default() });
+                r.expr = s.expr.as_deref();
+                r.cache = Some(&cache);
+                r.accel = Some(gpu);
+                r.profile = prof;
+                let t = comp.frame_rate.tick_of(f0 + i);
+                if view {
+                    let b = std::time::Instant::now();
+                    std::hint::black_box(gpu.render_display(&r, cid, t));
+                    let c = std::time::Instant::now();
+                    gpu.wait();
+                    split[0] += (c - b).as_secs_f64() * 1e3;
+                    split[1] += c.elapsed().as_secs_f64() * 1e3;
+                } else {
+                    std::hint::black_box(r.comp_frame(cid, t));
+                }
+            }
+            t0.elapsed().as_secs_f64() * 1e3 / n as f64
+        };
+        let prof = std::sync::Mutex::new(Vec::new());
+        let cpu = run(Backend::Cpu, false, Some(&prof));
+        let src: f64 = prof.into_inner().unwrap_or_default().iter().map(|l| l.process_ms - l.effects.iter().map(|e| e.1).sum::<f64>()).sum::<f64>() / n as f64;
+        let gpu_ms = run(Backend::Gpu, false, None);
+        let view = run(Backend::Gpu, true, None);
+        let [rec, g] = split.map(|v| v / n as f64);
+        note!("{name:<28} {src:>9.2} {cpu:>9.2} {gpu_ms:>9.2} {view:>9.2} {:>9.1}         {rec:>7.2} {g:>7.2}", 1000.0 / view.max(1e-9));
+    }
 }
 
 #[cfg(test)]

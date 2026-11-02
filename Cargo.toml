@@ -45,6 +45,7 @@ effectcraft-automation = { path = "crates/automation" }
 effectcraft-opusenc = { path = "crates/opusenc" }
 effectcraft-script = { path = "crates/script" }
 effectcraft-hevcenc = { path = "crates/hevcenc" }
+effectcraft-hwcodec = { path = "crates/hwcodec" }
 effectcraft-av1enc = { path = "crates/av1enc" }
 effectcraft-plugin = { path = "crates/plugin" }
 

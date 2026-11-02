@@ -31,11 +31,16 @@ fn out_dir(name: &str) -> PathBuf {
 }
 
 fn project(audio: Option<&Path>) -> (Project, ItemId) {
+    project_sized(W, H, audio)
+}
+
+/// [`project`] at `w`×`h`: the red solid stays 32 px wide in the middle.
+fn project_sized(w: u32, h: u32, audio: Option<&Path>) -> (Project, ItemId) {
     let mut p = Project::default();
-    let mut comp = Comp::new(W, H, FrameRate::new(10, 1), Tick::from_seconds_f64(1.2));
+    let mut comp = Comp::new(w, h, FrameRate::new(10, 1), Tick::from_seconds_f64(1.2));
     comp.background = BG;
-    let sid = p.add_item("Red", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 32, height: H, pixel_aspect: 1.0 }));
-    let mut l = build::layer(&mut p, &comp, "Red", LayerSource::Solid { item: sid }, (32, H), None);
+    let sid = p.add_item("Red", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 32, height: h, pixel_aspect: 1.0 }));
+    let mut l = build::layer(&mut p, &comp, "Red", LayerSource::Solid { item: sid }, (32, h), None);
     l.in_point = comp.frame_rate.tick_of(5);
     comp.layers.push(l);
     if let Some(path) = audio {
@@ -155,6 +160,72 @@ fn ffmpeg_check(path: &Path, tol: f32) {
                 eprintln!("ffmpeg not found: skipping oracle decode");
                 return;
             }
+        }
+    }
+}
+
+/// H.264 and HEVC at a size the GPU's encoder takes (hardware where the machine has one, the
+/// software encoder otherwise): every frame decodes, with the picture, by our decoder and ffmpeg.
+#[test]
+fn hardware_sized_mp4_roundtrip() {
+    let (w, h) = (320, 240);
+    for (fmt, name) in [(OutputFormat::H264, "h264"), (OutputFormat::Hevc, "hevc")] {
+        let d = out_dir(&format!("hw-{name}"));
+        let (p, cid) = project_sized(w, h, None);
+        let om = OutputModule { bitrate_kbps: 4000, ..OutputModule::for_format(fmt) };
+        let path = d.join("comp.mp4");
+        run(&p, cid, &NoFootage, &om, &path);
+        let f = effectcraft_media::probe(&path).expect("probe our output");
+        assert_eq!((f.width, f.height), (w, h), "{name}");
+        assert_eq!(f.frame_rate.frame_at(f.duration - Tick(1)) + 1, FRAMES as i64, "{name}: frames");
+        let pool = MediaPool::new();
+        for k in 0..FRAMES {
+            check_frame(&pool.frame_at(&f, f.frame_rate.tick_of(k as i64)).expect("decode"), k, 0.08);
+        }
+        ffmpeg_check(&path, 0.08);
+        if let Some(s) = ffprobe(&path) {
+            assert!(s.contains(&format!("{name}|320|240|yuv420p")), "{s}");
+        }
+        // The GPU's decoder (where there is one) lands on the same frames: background luma
+        // (Y ≈ 43) through frame 4, the red solid's (Y ≈ 63) from frame 5, also when asked a
+        // unit before a frame's timestamp (callers' time bases round the other way).
+        match effectcraft_hwcodec::Decoder::open(&path, w, h) {
+            Ok(dec) => {
+                let centre = |f: &effectcraft_hwcodec::Frame| f.y[(f.height as usize / 2) * f.width as usize + f.width as usize / 2];
+                for (k, want) in [(0, 43), (4, 43), (5, 63), (11, 63), (2, 43)] {
+                    let f = dec.frame_at(k * 1_000_000 - 1).expect("hardware decode");
+                    let y = centre(&f);
+                    assert!(y.abs_diff(want) <= 6, "{name}: hardware frame {k} centre Y {y}, want ≈ {want}");
+                }
+                // Parallel renders ask for a window of frames at once, in any order: each gets
+                // its own frame (none waits on a later request).
+                std::thread::scope(|sc| {
+                    for k in [7i64, 0, 11, 3, 9, 5, 1, 10, 4, 8, 2, 6] {
+                        let dec = &dec;
+                        sc.spawn(move || {
+                            let f = dec.frame_at(k * 1_000_000 + 500_000).expect("parallel decode");
+                            assert_eq!(f.time / 1_000_000, k, "{name}: parallel request for frame {k}");
+                            assert!(centre(&f).abs_diff(if k >= 5 { 63 } else { 43 }) <= 6);
+                        });
+                    }
+                });
+                // A looping layer rendered in parallel asks near the end and near the start at
+                // once: a request the decoder seeked away from still gets its own frame, soon.
+                let t0 = std::time::Instant::now();
+                std::thread::scope(|sc| {
+                    for i in 0..8i64 {
+                        let dec = &dec;
+                        sc.spawn(move || {
+                            for k in [11 - i % 3, i % 3, 10 - i % 2, 1 + i % 2] {
+                                let f = dec.frame_at(k * 1_000_000 + 500_000).expect("looping decode");
+                                assert_eq!(f.time / 1_000_000, k, "{name}: looping request for frame {k}");
+                            }
+                        });
+                    }
+                });
+                assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{name}: looping requests took {:?}", t0.elapsed());
+            }
+            Err(why) => eprintln!("{name}: no hardware decoder here ({why})"),
         }
     }
 }

@@ -166,3 +166,12 @@ fn displacement_map_layer() {
         }
     }
 }
+
+#[test]
+fn detail_preserving_upscale() {
+    // Default (200 %, bicubic alpha, Detail 20), bilinear alpha with Reduce Noise and full
+    // Detail, an uneven scale without Detail; effect_case covers adjustment layers (in place).
+    effect_case("ec.distort.upscale", &[("scale", n(200.0))]);
+    effect_case("ec.distort.upscale", &[("scale", n(150.0)), ("alpha", e(0)), ("reduceNoise", n(40.0)), ("detail", n(100.0))]);
+    effect_case("ec.distort.upscale", &[("scale", n(333.0)), ("detail", n(0.0))]);
+}

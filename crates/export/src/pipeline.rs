@@ -252,6 +252,54 @@ impl<'a> Cx<'a> {
         img
     }
 
+    /// Output frame `i` as 8-bit 4:2:0 of `w`×`h`, rendered and converted on the GPU so only the
+    /// planes come back, when nothing between the render and the encoder needs the CPU: a
+    /// progressive frame at the project's colour depth, no crop or resize, opaque RGB, a frame
+    /// the codec takes at its size. `None`: render it with [`Cx::frame`].
+    pub(crate) fn frame_yuv420(&self, comp: &Comp, i: u64, w: u32, h: u32) -> Option<effectcraft_render::Yuv420> {
+        if !self.gpu_yuv420() {
+            return None;
+        }
+        let FrameSample::Progressive(t) = self.job.settings.sample(comp, i) else { return None };
+        let depth = self.job.settings.color_depth;
+        let om = self.job.output;
+        if (depth != ColorDepth::Current && depth.resolve(self.project.settings.bit_depth).levels().is_some())
+            || om.crop.edges(w, h, 1.0) != (0, 0, 0, 0)
+            || om.resize.enabled
+        {
+            return None;
+        }
+        let t0 = Instant::now();
+        let yuv = self.renderer().comp_frame_yuv420(self.job.comp, t, comp.background)?;
+        if (yuv.width, yuv.height) != (w, h) {
+            return None;
+        }
+        if let Some(ft) = &self.frame_times {
+            ft.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, t0.elapsed().as_secs_f64()));
+        }
+        Some(yuv)
+    }
+
+    /// Whether frames render on the GPU and can come back as 4:2:0 ([`Cx::frame_yuv420`]).
+    pub(crate) fn gpu_yuv420(&self) -> bool {
+        !self.deferred() && self.project.settings.gpu_acceleration && self.job.accel.is_some_and(|a| a.available())
+    }
+
+    /// Output frames `ks` for a video encoder: 8-bit 4:2:0 from the GPU where it can
+    /// ([`Cx::frame_yuv420`], when `yuv`), otherwise `channels` RGBA of `w`×`h` ([`Cx::pixels`]).
+    pub(crate) async fn pictures(&self, comp: &Comp, ks: Vec<u64>, channels: Channels, w: u32, h: u32, yuv: bool) -> Vec<crate::encode::Picture> {
+        use crate::encode::Picture;
+        if yuv && channels == Channels::Rgb && !self.deferred() {
+            let gpu_live = || self.job.accel.is_none_or(|a| a.available());
+            let pic = |k: u64| match self.frame_yuv420(comp, k, w, h) {
+                Some(y) => Picture::Yuv(y),
+                None => Picture::Rgba(self.pixels(&self.frame(comp, k), comp, channels, w, h)),
+            };
+            return map_frames_while(ks, self.gpu_cap(), gpu_live, pic, |_, p| p);
+        }
+        self.frames(comp, ks, |_, img| Picture::Rgba(self.pixels(&img, comp, channels, w, h))).await
+    }
+
     /// Output Module ▸ Crop, then Resize.
     fn crop_resize(&self, img: Image) -> Image {
         let om = self.job.output;

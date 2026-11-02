@@ -22,12 +22,14 @@ const ENTRIES: &[&str] = &[
     "bokeh_prefix",
     "bokeh_gather",
     "fill",
+    "yuv_rgba",
+    "yuv_half",
 ];
 
 /// Effect entry points in `kernels.wgsl`. Like the `fx_*` kernels, one that fails to build
 /// (a driver's shader compiler rejecting it, #613) leaves its effects to the CPU instead of
 /// turning the whole compositor off.
-const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
+const EFFECT_ENTRIES: &[&str] = &["box_h", "box_v", "gauss_pass", "directional", "glow_bright", "glow_combine", "shadow_make", "shadow_combine", "pointwise"];
 
 /// Entry points that also bind group 1 (four read-only storage buffers; see
 /// [`Enc::dispatch_ext`]).
@@ -361,6 +363,9 @@ pub struct GpuContext {
     display: wgpu::ComputePipeline,
     /// The display texture's next mip level from the one above (`display.wgsl` `mip`).
     display_mip: wgpu::ComputePipeline,
+    /// Export's 8-bit 4:2:0 planes from a frame (`yuv.wgsl`).
+    yuv_bgl: wgpu::BindGroupLayout,
+    yuv: wgpu::ComputePipeline,
     dummy: wgpu::Texture,
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
@@ -691,6 +696,39 @@ impl GpuContext {
         };
         let display = display_pipeline("display")?;
         let display_mip = display_pipeline("mip")?;
+        let ymodule = init_resource(&device, "yuv shader module", || {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("effectcraft yuv"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("shaders/yuv.wgsl").into()),
+            })
+        })?;
+        let buf_entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let yuv_bgl = init_resource(&device, "yuv bind-group layout", || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("effectcraft yuv"),
+                entries: &[buf_entry(0, wgpu::BufferBindingType::Uniform), tex_entry(1), buf_entry(2, wgpu::BufferBindingType::Storage { read_only: false })],
+            })
+        })?;
+        let yuv = init_resource(&device, "yuv compute pipeline", || {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("effectcraft yuv"),
+                bind_group_layouts: &[Some(&yuv_bgl)],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("yuv420"),
+                layout: Some(&layout),
+                module: &ymodule,
+                entry_point: Some("yuv420"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        })?;
         let dummy = init_resource(&device, "dummy texture", || {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dummy"),
@@ -720,6 +758,8 @@ impl GpuContext {
             display_bgl,
             display,
             display_mip,
+            yuv_bgl,
+            yuv,
             dummy_tex,
             dummy,
             dummy_buf,
@@ -1296,6 +1336,133 @@ impl<'g> Enc<'g> {
         let mut out = Image { width: img.width, height: img.height, data };
         let dst: &mut [u8] = bytemuck::cast_slice_mut(&mut out.data);
         self.read_texture_into(&img.texture, img.width, img.height, 16, dst)?;
+        Some(out)
+    }
+
+    /// `img` over the opaque `bg` as export's 8-bit 4:2:0 planes (`yuv.wgsl`), read back: 1.5
+    /// bytes a pixel instead of [`Enc::download`]'s 16. `None` where readback is impossible.
+    pub fn yuv420(&mut self, img: &GpuImage, bg: [f32; 3]) -> Option<effectcraft_render::Yuv420> {
+        let g = self.g;
+        if !g.can_wait() {
+            return None;
+        }
+        let (w, h) = (img.width as usize, img.height as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (ys, cs) = (w.next_multiple_of(8), cw.next_multiple_of(4));
+        let len = ys.checked_mul(h)?.checked_add(cs.checked_mul(ch)?.checked_mul(2)?)?;
+        if len as u64 > g.device.limits().max_storage_buffer_binding_size {
+            return None;
+        }
+        let params = [w as u32, h as u32, ys as u32, cs as u32, ch as u32, 0, 0, 0, bg[0].to_bits(), bg[1].to_bits(), bg[2].to_bits(), 0];
+        let ub = g.buffer_init(None, bytemuck::cast_slice(&params), wgpu::BufferUsages::UNIFORM);
+        let out = g.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("yuv"),
+            size: len as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let size = len as u64;
+        let staging = g.staging.lock().ok().and_then(|mut s| s.get_mut(&size).and_then(Vec::pop)).unwrap_or_else(|| {
+            g.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let sv = img.texture.create_view(&Default::default());
+        let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &g.yuv_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sv) },
+                wgpu::BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+            ],
+        });
+        let enc = self.encoder();
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("yuv420"), timestamp_writes: None });
+            pass.set_pipeline(&g.yuv);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(cw.div_ceil(4).div_ceil(8) as u32, ch.div_ceil(8) as u32, 1);
+        }
+        enc.copy_buffer_to_buffer(&out, 0, &staging, 0, size);
+        self.submit();
+        g.transfers.count(false, len);
+        let bytes = g.read_buffer(&staging, len, len, 1).map_err(|e| log::error!("gpu yuv readback: {e}")).ok()?;
+        if let Ok(mut s) = g.staging.lock() {
+            let v = s.entry(size).or_default();
+            if v.len() < 2 {
+                v.push(staging);
+            }
+        }
+        // Tight planes from the padded rows.
+        let plane = |off: usize, stride: usize, row: usize, rows: usize| -> Option<Vec<u8>> {
+            let mut p = Vec::with_capacity(row * rows);
+            for r in 0..rows {
+                p.extend_from_slice(bytes.get(off + r * stride..off + r * stride + row)?);
+            }
+            Some(p)
+        };
+        let y = plane(0, ys, w, h)?;
+        let u = plane(ys * h, cs, cw, ch)?;
+        let v = plane(ys * h + cs * ch, cs, cw, ch)?;
+        Some(effectcraft_render::Yuv420 { width: img.width, height: img.height, y, u, v })
+    }
+
+    /// A movie frame from its decoder's 4:2:0 planes (`FootageSource::frame_yuv420`): 1.5 bytes
+    /// a pixel uploaded as two R8 textures (Y; U rows above V rows) and converted to the encoded
+    /// RGBA the CPU's footage frame holds (`kernels.wgsl` `yuv_rgba`). `None`: planes that don't
+    /// fill the frame, or a frame over the texture limit.
+    // ponytail: two fresh R8 textures a frame; pool them if allocation ever shows in a profile.
+    ///
+    /// `half`: the frame at half its size (even sizes), as effectcraft-media's `half_420` makes
+    /// a reduced-resolution render's frame (`yuv_half`).
+    pub fn movie_frame(&mut self, f: &effectcraft_render::YuvFrame, half: bool) -> Option<GpuImage> {
+        let g = self.g;
+        let (w, h) = (f.width, f.height);
+        if half && (!w.is_multiple_of(2) || !h.is_multiple_of(2) || w < 2 || h < 2) {
+            return None;
+        }
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let (n, c) = (w as usize * h as usize, cw as usize * ch as usize);
+        if w == 0 || h == 0 || !g.fits(w, h.max(2 * ch)) || f.y.len() < n || f.u.len() < c || f.v.len() < c {
+            return None;
+        }
+        let tex = |tw: u32, th: u32, label: &'static str| {
+            g.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let write = |t: &wgpu::Texture, y0: u32, tw: u32, th: u32, bytes: &[u8]| {
+            g.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: t, mip_level: 0, origin: wgpu::Origin3d { x: 0, y: y0, z: 0 }, aspect: wgpu::TextureAspect::All },
+                bytes,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(tw), rows_per_image: Some(th) },
+                wgpu::Extent3d { width: tw, height: th, depth_or_array_layers: 1 },
+            )
+        };
+        let ty = tex(w, h, "movie luma");
+        let tc = tex(cw, 2 * ch, "movie chroma");
+        write(&ty, 0, w, h, f.y.get(..n)?);
+        write(&tc, 0, cw, ch, f.u.get(..c)?);
+        write(&tc, ch, cw, ch, f.v.get(..c)?);
+        g.transfers.count(true, n + 2 * c);
+        let mut p = Params::default();
+        p.u[0] = [cw, ch, 0, 0];
+        p.f[0] = [f.k[0], f.k[1], f.k[2], f.k[3]];
+        p.f[1] = [f.k[4], f.k[5], f.k[6], f.k[7]];
+        let (ow, oh, entry) = if half { (w / 2, h / 2, "yuv_half") } else { (w, h, "yuv_rgba") };
+        let out = self.scratch(ow, oh);
+        self.pixels(entry, &p, &GpuImage::new(ty, w, h), Some(&GpuImage::new(tc, cw, 2 * ch)), &out, None);
         Some(out)
     }
 

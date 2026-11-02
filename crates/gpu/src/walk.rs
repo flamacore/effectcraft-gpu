@@ -218,6 +218,9 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
+    if let Some(done) = draw_movie(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
         return done;
     }
@@ -248,6 +251,67 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     tmp = place(e, r, ctx, layer, &st.body, &tmp, layer.blend_mode, 1.0, None)?;
     *canvas = ops::channel_mix(e, canvas, &tmp, bl.channels, opacity);
     Some(())
+}
+
+/// A movie layer whose source is just its decoded frame (`Renderer::plain_movie_source`), built
+/// here from the decoder's 4:2:0 planes (`FootageSource::frame_yuv420`: 1.5 bytes a pixel
+/// uploaded instead of the CPU's 16-byte float frame, which is never made), then converted from
+/// the footage's colour profile and quantised as the CPU's source buffer is, its effects run
+/// resident and placed. `None`: not such a layer, or the source has no planes for the frame;
+/// `Some(None)`: the GPU failed.
+fn draw_movie(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    if styles::active(ctx, layer) || layer.preserve_transparency || r.track_matte(ctx, layer).is_some() {
+        return None;
+    }
+    let (item, f, t, reduced) = r.plain_movie_source(ctx, layer)?;
+    let yuv = r.footage.frame_yuv420(item, f, t)?;
+    if (yuv.width, yuv.height) != (f.width, f.height) {
+        return None;
+    }
+    // A reduced render's frame at its size (`frame_at_size`, `footage_buf`): made at half size
+    // when that is at least as small, the rest of the way resampled, at the render's scale.
+    let (mut img, scale) = match reduced {
+        None => match e.movie_frame(&yuv, false) {
+            Some(img) => (img, 1.0),
+            None => return Some(None),
+        },
+        Some((rw, rh)) => {
+            let half = 2 * rw <= f.width && 2 * rh <= f.height && f.width.is_multiple_of(2) && f.height.is_multiple_of(2);
+            let Some(src) = e.movie_frame(&yuv, half) else { return Some(None) };
+            let img = if (src.width, src.height) == (rw, rh) {
+                src
+            } else {
+                let m = effectcraft_geom::Mat3::scale(effectcraft_geom::vec2(f64::from(rw) / f64::from(src.width), f64::from(rh) / f64::from(src.height)));
+                ops::warp(e, &e.zeros(rw, rh), &src, &m, effectcraft_raster::Sampling::Bilinear, BlendMode::Normal, 1.0, 0, None)
+            };
+            (img, r.opts.scale)
+        }
+    };
+    let pipe = r.pipe();
+    if let Some(c) = pipe.media_in(f) {
+        img = ops::convert(e, &img, &c);
+    }
+    if let Some(l) = pipe.levels {
+        img = ops::quantize(e, &img, l);
+    }
+    // From the layer's corner (`footage_buf`), which is also where its effect space starts (the
+    // source rectangle).
+    let (mut img, offset, scale) = if layer.switches.effects && layer.effects().is_some_and(|fx| !fx.children.is_empty()) {
+        let mut fx = crate::effects::GpuFx::new(e, img, [0.0; 2], scale, pipe.levels);
+        let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
+        let Some((img, off, sc)) = fx.finish() else { return Some(None) };
+        (img, [off[0] - origin[0] * sc, off[1] - origin[1] * sc], sc)
+    } else {
+        (img, [0.0; 2], scale)
+    };
+    if img.width == 0 || img.height == 0 {
+        return Some(Some(()));
+    }
+    if let Some(c) = pipe.to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
+    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
+    Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
 }
 
 /// A plain layer with effects, its effect stack run on the GPU: the source (+ masks, from the

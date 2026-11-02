@@ -1412,6 +1412,7 @@ dependencies = [
  "effectcraft-color",
  "effectcraft-effects",
  "effectcraft-hevcenc",
+ "effectcraft-hwcodec",
  "effectcraft-keyframe",
  "effectcraft-media",
  "effectcraft-opusenc",
@@ -1514,6 +1515,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "effectcraft-hwcodec"
+version = "0.17.0"
+dependencies = [
+ "log",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "effectcraft-interchange"
 version = "0.17.0"
 dependencies = [
@@ -1567,6 +1576,7 @@ name = "effectcraft-media"
 version = "0.17.0"
 dependencies = [
  "craft-docpath",
+ "effectcraft-hwcodec",
  "effectcraft-model",
  "effectcraft-pdf",
  "effectcraft-project",
