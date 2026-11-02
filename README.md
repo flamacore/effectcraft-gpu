@@ -57,13 +57,28 @@ upstream accepts, so the GPU renderer lives here and follows upstream `main`.
 
 ### Run it
 
+The desktop app builds as two executables side by side, sharing settings and recent projects:
+
+| Executable | Renders with |
+|---|---|
+| `effectcraft-gpu` | the GPU renderer: the GPU compositor and the hardware codecs |
+| `effectcraft` | the CPU only, with the pure-Rust codecs. Its window title says "(CPU)" |
+
 ```bash
-cargo run --release -p effectcraft
+cargo run --release --bin effectcraft-gpu
 ```
+
+```bash
+cargo run --release --bin effectcraft
+```
+
+`cargo build --release -p effectcraft` builds both into `target/release`. To time a project:
 
 ```bash
 cargo run --release -p effectcraft-cli -- --project my.ecproj bench --gpu --play 120
 ```
+
+In `effectcraft-gpu` these switch parts of it off:
 
 | Switch | Effect |
 |---|---|

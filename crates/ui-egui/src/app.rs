@@ -73,6 +73,7 @@ impl EffectcraftApp {
             viewer_readback: Default::default(),
             wgpu: None,
             gpu: None,
+            cpu_only: false,
             gpu_checked: false,
             gpu_failures: None,
             gpu_failure_applied: None,

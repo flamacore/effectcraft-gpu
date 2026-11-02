@@ -205,6 +205,9 @@ compositor's 16-byte float pixels.
   batch of frames renders while one encodes. The software encoders take the same planes.
 - *Switches:* `EFFECTCRAFT_HW_DECODE=0` / `EFFECTCRAFT_HW_ENCODE=0` turn the hardware codecs off;
   `EFFECTCRAFT_MF_D3D=0` / `1` forces Media Foundation's CPU / the GPU's decoder.
+- *Two desktop executables:* `effectcraft-gpu` runs this path. `effectcraft`, the CPU build, turns
+  the hardware codecs off (`hwcodec::turn_off`) and never sets up the GPU compositor
+  (`EffectcraftApp::cpu_only`): every frame renders on the CPU.
 
 A **layer cache** keeps each layer's finished pixels (source, masks and effects) keyed by a hash of
 its evaluated inputs, excluding the transform. Static and transform-only layers render once;

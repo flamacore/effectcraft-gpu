@@ -71,7 +71,8 @@ pub fn project_name(app: &EffectcraftApp) -> String {
 /// The window title: the project's path (or name) and `*` while it has unsaved changes.
 pub fn window_title(app: &EffectcraftApp) -> String {
     let doc = app.session.path.clone().unwrap_or_else(|| project_name(app));
-    format!("EffectCraft - {doc}{}", if app.session.is_dirty() { " *" } else { "" })
+    let build = if app.cpu_only { " (CPU)" } else { "" };
+    format!("EffectCraft{build} - {doc}{}", if app.session.is_dirty() { " *" } else { "" })
 }
 
 /// Whether the prompt is Revert Project (Revert / Cancel) instead of Unsaved Changes.
@@ -220,6 +221,10 @@ mod tests {
         assert!(app.dialog.is_none());
         modified(&mut app);
         assert!(window_title(&app).ends_with("Untitled Project.ecproj *"), "{}", window_title(&app));
+        // The desktop app's CPU build says so in the title.
+        app.cpu_only = true;
+        assert_eq!(window_title(&app), "EffectCraft (CPU) - Untitled Project.ecproj *");
+        app.cpu_only = false;
         let r = crate::menus::invoke(&mut app, &ctx, "file.newProject", json!({})).unwrap();
         assert_eq!(r, json!({"dialog": "unsavedChanges"}));
         assert_eq!(app.dialog, Some(Dialog::UnsavedChanges));

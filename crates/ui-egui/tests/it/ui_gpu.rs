@@ -87,6 +87,29 @@ fn viewer_draws_gpu_frames_that_match_the_cpu() {
     }
 }
 
+/// The desktop app's CPU build (`effectcraft`) never sets up the GPU compositor, on a device
+/// where `effectcraft-gpu` gets one (the test above).
+#[test]
+fn the_cpu_build_renders_on_the_cpu() {
+    let Some(probe) = effectcraft_gpu::Gpu::headless() else {
+        eprintln!("no GPU adapter: skipping");
+        return;
+    };
+    let adapter = effectcraft_engine::render::Accelerator::name(&probe);
+    drop(probe);
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).with_pixels_per_point(1.0).wgpu_setup(same_adapter(adapter)).build_eframe(|_| {
+        let mut app = EffectcraftApp::new(s);
+        app.cpu_only = true;
+        app
+    });
+    settle(&mut h);
+    assert!(h.state().gpu_adapter().is_none() && h.state().session.accel.is_none(), "no GPU compositor");
+    assert!(h.state().session.accel_note.as_deref().is_some_and(|n| n.starts_with("CPU build")), "{:?}", h.state().session.accel_note);
+    assert!(h.state_mut().viewer_pixels().is_some(), "the viewer shows the CPU frame");
+}
+
 /// Once the graphics device is lost, eframe's renderer cannot stage buffers and egui-wgpu
 /// panicked on the main thread drawing the next frame (#591). The app now draws nothing,
 /// auto-saves unsaved changes and closes its window instead.

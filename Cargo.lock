@@ -1290,6 +1290,7 @@ dependencies = [
  "craft-update",
  "effectcraft-engine",
  "effectcraft-host",
+ "effectcraft-hwcodec",
  "effectcraft-ui-egui",
  "eframe",
  "egui",

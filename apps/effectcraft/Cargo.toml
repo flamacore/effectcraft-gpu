@@ -6,12 +6,19 @@ edition.workspace = true
 license.workspace = true
 default-run = "effectcraft"
 
+# Shared by the two executables: `effectcraft` (src/main.rs, the CPU build) and `effectcraft-gpu`
+# (src/bin/effectcraft-gpu.rs). Its own name, so its docs don't collide with the binary's.
+[lib]
+name = "effectcraft_desktop"
+
 [lints]
 workspace = true
 
 [dependencies]
 effectcraft-engine = { workspace = true }
 effectcraft-host = { workspace = true }
+# The CPU build turns the hardware codecs off.
+effectcraft-hwcodec = { workspace = true }
 effectcraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 # `links`: links (Help menu, Discord, Settings) open in the system browser.

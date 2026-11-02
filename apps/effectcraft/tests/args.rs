@@ -76,3 +76,12 @@ fn version_still_prints_with_a_bad_port_variable() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("effectcraft {}\n", env!("CARGO_PKG_VERSION")));
 }
+
+/// The GPU build is its own executable, named in its output.
+#[test]
+fn the_gpu_build_names_itself() {
+    let gpu = std::env::var_os("NEXTEST_BIN_EXE_effectcraft_gpu").unwrap_or_else(|| env!("CARGO_BIN_EXE_effectcraft-gpu").into());
+    let out = Command::new(gpu).arg("--version").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("effectcraft-gpu {}\n", env!("CARGO_PKG_VERSION")));
+}

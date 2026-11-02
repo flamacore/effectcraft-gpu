@@ -14,6 +14,20 @@ mod mf;
 #[cfg(windows)]
 mod mf_decode;
 
+/// Set by [`turn_off`].
+static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn the hardware codecs off for the rest of the process: from now on [`Decoder::open`] and
+/// [`Encoder::new`] fail and EffectCraft keeps its pure-Rust codecs (the desktop app's CPU build).
+pub fn turn_off() {
+    OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Why [`Decoder::open`] and [`Encoder::new`] fail after [`turn_off`].
+fn turned_off() -> Result<(), String> {
+    if OFF.load(std::sync::atomic::Ordering::Relaxed) { Err("hardware codecs are off in this build".into()) } else { Ok(()) }
+}
+
 /// Y'CbCr matrix of decoded frames.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Matrix {
@@ -80,6 +94,7 @@ impl Decoder {
     /// Open `path` (frames of `width` × `height`, which picks the GPU's decoder or the
     /// platform's CPU one, whichever is faster for that size), or say why it can't be.
     pub fn open(path: &std::path::Path, width: u32, height: u32) -> Result<Decoder, String> {
+        turned_off()?;
         #[cfg(windows)]
         {
             mf_decode::open(path, u64::from(width) * u64::from(height)).map(|inner| Decoder { inner })
@@ -159,6 +174,7 @@ pub struct Encoder {
 impl Encoder {
     /// A hardware encoder for `cfg`, or why there is none.
     pub fn new(cfg: EncoderConfig) -> Result<Encoder, String> {
+        turned_off()?;
         if cfg.width == 0 || cfg.height == 0 || !cfg.width.is_multiple_of(2) || !cfg.height.is_multiple_of(2) {
             return Err(format!("{}×{}: hardware encoders take even frame sizes", cfg.width, cfg.height));
         }

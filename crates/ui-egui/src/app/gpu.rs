@@ -142,6 +142,10 @@ impl EffectcraftApp {
             info.device_type,
             if info.driver.is_empty() { String::new() } else { format!(", {} {}", info.driver, info.driver_info) }
         ));
+        if self.cpu_only {
+            self.session.accel_note = Some("CPU build: the GPU compositor is off (effectcraft-gpu renders on the GPU)".into());
+            return;
+        }
         // Backend validation can panic on shader compilation even when device creation
         // succeeded. Keep the document and the egui renderer, and use CPU compositing.
         let gpu = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| effectcraft_gpu::Gpu::new(&rs.adapter, rs.device.clone(), rs.queue.clone())));

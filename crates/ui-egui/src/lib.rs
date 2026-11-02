@@ -298,6 +298,9 @@ pub struct EffectcraftApp {
     pub(crate) wgpu: Option<eframe::egui_wgpu::RenderState>,
     /// The GPU compositor on that device (None: no usable adapter → CPU only).
     pub(crate) gpu: Option<effectcraft_gpu::Gpu>,
+    /// The desktop app's CPU build: the GPU compositor is never set up, so every frame renders
+    /// on the CPU, and the window title says "(CPU)". `effectcraft-gpu` leaves it off.
+    pub cpu_only: bool,
     gpu_checked: bool,
     gpu_failures: Option<gpu_failure::GpuFailureBridge>,
     gpu_failure_applied: Option<bool>,
