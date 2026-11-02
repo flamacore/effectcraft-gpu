@@ -306,6 +306,25 @@ fn upscale_grows_about_centre() {
     assert!((c[0] - im.sample_bilinear(10.0, 5.0)[0]).abs() < 0.03);
 }
 
+/// Reduce Noise blurs with box passes, which can leave transparent pixels' alpha a hair below
+/// zero; Detail's clamp then had an upper bound below its lower one and panicked.
+#[test]
+fn upscale_detail_survives_noise_reduced_transparency() {
+    // Soft, uneven alpha inside a transparent border (box-pass running sums then leave
+    // rounding residue where it goes back to zero).
+    let mut im = Image::new(70, 44);
+    for y in 0..44u32 {
+        for x in 0..70u32 {
+            let (u, v) = (x as f32 / 70.0 - 0.5, y as f32 / 44.0 - 0.5);
+            let n = ((x * 7919 + y * 104_729) % 97) as f32 / 97.0;
+            let a = ((0.42 - (u * u + v * v).sqrt()) * 6.0).clamp(0.0, 1.0) * (0.55 + 0.45 * n);
+            im.set(x, y, [0.9 * a * n, 0.4 * a, 0.7 * a * (1.0 - n), a]);
+        }
+    }
+    let o = run("ec.distort.upscale", &[("scale", num(150.0)), ("alpha", Value::Enum(0)), ("reduceNoise", num(40.0)), ("detail", num(100.0))], im, &[]);
+    assert!(o.img.data.iter().all(|p| p.iter().all(|v| v.is_finite() && *v > -1e-6)));
+}
+
 #[test]
 fn twirl_legacy_rotates_inside_radius() {
     let im = img(40, 40);

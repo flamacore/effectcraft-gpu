@@ -898,7 +898,8 @@ fn upscale(ctx: &EffectCtx, mut b: Buf) -> Buf {
         out.data.par_iter_mut().zip(blur.data.par_iter()).for_each(|(p, q)| {
             let a = p[3];
             for c in 0..3 {
-                p[c] = (p[c] + (p[c] - q[c]) * detail * 1.5).clamp(0.0, a.max(p[c]));
+                // (Reduce Noise's box passes can leave alpha a hair below 0: the bound stays ≥ 0.)
+                p[c] = (p[c] + (p[c] - q[c]) * detail * 1.5).clamp(0.0, a.max(p[c]).max(0.0));
             }
         });
     }
