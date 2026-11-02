@@ -1,3 +1,84 @@
+# EffectCraft GPU
+
+> [!IMPORTANT]
+> **A true GPU renderer for [EffectCraft](https://github.com/storytold/effectcraft).** A frame stays
+> on the graphics card from the video decoder to the video encoder, the way a game engine renders,
+> so preview plays in real time and export runs an order of magnitude faster.
+
+This is a fork of EffectCraft, the open-source After Effects-class compositor written in Rust.
+Upstream already composites on the GPU, but every frame takes a detour through the CPU:
+- footage is decoded in software and turned into 16-byte-a-pixel float frames;
+- those frames are uploaded to the GPU, composited, and read back;
+- export then encodes them in software.
+
+EffectCraft GPU removes that detour:
+- the graphics card's own decoder decodes the footage;
+- GPU kernels build each frame, composite it and run its effects;
+- the GPU converts the result to 4:2:0 and hands it to the hardware encoder.
+
+The only thing that ever crosses the bus is 8-bit 4:2:0 planes, at 1.5 bytes a pixel.
+
+| 1080p benchmark projects, RTX 4080 SUPER | EffectCraft | EffectCraft GPU |
+|---|---|---|
+| Preview | 5–38 fps | **146–231 fps** |
+| Export | 5–15 fps | **167–278 fps** |
+
+A real project with a looping, time-remapped footage layer was the worst case. It took 180–220 ms
+a frame, about 5 fps. It now plays at its full 30 fps in real time, about 19 ms a frame, with
+video memory flat instead of running out.
+
+### What's different
+
+- **Hardware decoding.** 8-bit 4:2:0 H.264 and HEVC decode through the platform decoder: NVDEC,
+  AMD AMF or Intel Quick Sync, through Media Foundation. A thread per file decodes ahead of
+  playback, so the next frame is ready. It stays ready even when parallel frames ask for times far
+  apart, as a looping layer or a clip used twice does.
+- **Footage built on the GPU.** A footage layer is built in a kernel from the decoder's planes and
+  runs its effects there. The CPU never makes or uploads a float frame.
+- **Steady video memory.** Two frames render on the GPU at once, however many frame threads are
+  running. Video memory stays flat, and the compositor never falls back to the CPU because it ran
+  out.
+- **GPU effects.** Small Gaussian blurs and Detail-preserving Upscale run as GPU kernels.
+- **Hardware encoding.** H.264 and HEVC export converts to 4:2:0 on the GPU and goes straight into
+  the GPU's encoder: NVENC, AMF or Quick Sync. The next batch of frames renders while one encodes.
+- **A benchmark for the viewer path.** `effectcraft-cli bench --gpu --play N` times N consecutive
+  frames on the CPU, on the GPU, and through the viewer's GPU path.
+
+The hardware codecs are Windows-only for now. On macOS, Linux and the web, and for other formats,
+footage decodes and encodes with the pure-Rust codecs as upstream does, and compositing stays on
+the GPU. How the frame path works is described in
+[docs/architecture.md](docs/architecture.md#4-rendering), under "The GPU frame path".
+
+### Why a fork
+
+Upstream's rules are pure Rust and no `unsafe`. This fork's `hwcodec` crate calls the platform's
+codec APIs, and it is the one crate that needs `unsafe` to do so. That puts it outside what
+upstream accepts, so the GPU renderer lives here and follows upstream `main`.
+
+### Run it
+
+```bash
+cargo run --release -p effectcraft
+```
+
+```bash
+cargo run --release -p effectcraft-cli -- --project my.ecproj bench --gpu --play 120
+```
+
+| Switch | Effect |
+|---|---|
+| `EFFECTCRAFT_HW_DECODE=0` | decode footage with the pure-Rust codecs |
+| `EFFECTCRAFT_HW_ENCODE=0` | export with the software encoders |
+| `EFFECTCRAFT_MF_D3D=0` / `1` | force Media Foundation's CPU decoder / the GPU's decoder (by default the CPU decoder handles up to 1080p and the GPU decoder anything larger) |
+
+<br>
+
+---
+
+*Upstream EffectCraft's README follows.*
+
+---
+
 <p align="center">
   <a href="https://getartcraft.com/">
     <picture>
